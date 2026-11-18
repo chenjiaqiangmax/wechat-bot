@@ -61,9 +61,9 @@ guia = ["winrt-runtime>=2.0.0", "winrt-Windows.Media.Ocr>=2.0.0",
         "winrt-Windows.Globalization>=2.0.0", "pypinyin>=0.48.0"]
 
 [project.urls]
-Homepage = "https://github.com/dazhi666666/wechat-deepseek"
-Repository = "https://github.com/dazhi666666/wechat-deepseek"
-Issues = "https://github.com/dazhi666666/wechat-deepseek/issues"
+Homepage = "https://github.com/chenjiaqiangmax/wechat-bot"
+Repository = "https://github.com/chenjiaqiangmax/wechat-bot"
+Issues = "https://github.com/chenjiaqiangmax/wechat-bot/issues"
 
 [tool.setuptools.packages.find]
 include = ["wechatauto*"]

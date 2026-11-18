@@ -1,8 +1,8 @@
 # wechat-deepseek —— 微信大肥鱼 DeepSeek
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-![License](https://img.shields.io/github/license/dazhi666666/wechat-deepseek)
-![GitHub stars](https://img.shields.io/github/stars/dazhi666666/wechat-deepseek)
+![License](https://img.shields.io/github/license/chenjiaqiangmax/wechat-bot)
+![GitHub stars](https://img.shields.io/github/stars/chenjiaqiangmax/wechat-bot)
 
 把本地大模型（DeepSeek / 任意 OpenAI 兼容接口）接进微信：一个开箱即用的
 **微信群聊 AI 机器人**，加上一套微信 4.x Windows 客户端自动化库
@@ -27,7 +27,7 @@
 ### 安装
 
 ```bash
-git clone https://github.com/dazhi666666/wechat-deepseek.git
+git clone https://github.com/chenjiaqiangmax/wechat-bot.git
 cd wechat-deepseek
 pip install -e .
 pip install pypinyin        # 可选

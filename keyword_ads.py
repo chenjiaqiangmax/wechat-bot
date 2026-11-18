@@ -50,7 +50,7 @@ DEFAULT_REPLY = (
     '看到群里有朋友在找便宜好用的模型 / token，自荐一下：'
     '大肥鱼是一个开源的微信群 AI 机器人，接任意 OpenAI 兼容接口（DeepSeek 等），'
     '@ 一下就回答，带群长期记忆和群消息搜索，部署教程在 '
-    'https://github.com/dazhi666666/wechat-deepseek'
+    'https://github.com/chenjiaqiangmax/wechat-bot'
 )
 
 DEFAULT_SOFT_REPLIES = [
