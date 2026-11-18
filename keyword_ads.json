@@ -1,0 +1,53 @@
+{
+  "enabled": true,
+  "default_group_enabled": true,
+  "mode": "soft",
+  "keywords": [
+    "便宜的模型",
+    "便宜模型",
+    "便宜的token",
+    "便宜token",
+    "便宜的 api",
+    "便宜api",
+    "低价api",
+    "低价模型",
+    "便宜的gpt",
+    "便宜的claude",
+    "便宜的key",
+    "白嫖模型",
+    "靠谱的中转站",
+    "靠谱中转站",
+    "便宜中转站",
+    "便宜的中转站"
+  ],
+  "reply": "https://llm.zrshuiwu.com\ndeepseek-v4.1-flash-1017  5 折",
+  "soft_replies": [
+    "刚好看到你在找{keyword}，我这边正好在用一家，给你个参考：\\n{reply}\\n你先看看，不合适就当我没说～",
+    "巧了，我最近也在看{keyword}，现在用的是这家：\\n{reply}\\n有需要可以看看，不需要忽略就行。",
+    "我这边有个在用的渠道，价格还可以：\\n{reply}\\n你先参考下，合适再说。"
+  ],
+  "soft_require_intent": true,
+  "soft_intent_words": [
+    "有没有",
+    "哪里",
+    "哪儿",
+    "求",
+    "推荐",
+    "渠道",
+    "多少钱",
+    "价格",
+    "怎么买",
+    "哪家",
+    "想找",
+    "在找",
+    "需要",
+    "好用",
+    "怎么选"
+  ],
+  "cooldown_seconds": 1800,
+  "cooldown_jitter_seconds": 600,
+  "reply_probability": 1.0,
+  "pre_delay_min_seconds": 1.0,
+  "pre_delay_max_seconds": 5.0,
+  "groups": {}
+}

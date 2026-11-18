@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+# 运行产物（含个人聊天数据，绝不入库）
+*.log
+dafeiyu_bot.log*
+wechatauto_logs/
+*_消息提取*.txt
+*_信息提炼*.md
+导出*.txt
+*.decrypted.db
+.keys.json
+# 表情包随仓库一起入库（2026-10-30 用户确认）
+# 编辑器
+.idea/
+.vscode/
+chatgpt_images/
+# 本地私密文件（含内网地址/密钥/聊天数据），绝不入库
+start_bot.cmd
+_llm_distill.py
+# 管理后台写出的机器人配置（含内网地址/密钥）
+bot_config.json
+# 机器人运行时产生的用量记录 / 见过的会话列表（含群名，不入库）
+usage.jsonl*
+known_chats.json*
+pending_replies.json*
+.mrdayone/artifacts/
+# 工具本地状态 / 个人聊天记录 / 宣传片渲染帧（含聊天截图素材，绝不入库）
+.claude/
+.zcode/
+*上下文.txt
+probe_tmp.py
+promo/_frames*/
+
+# 宣传片成片（单文件 85-94MB，GitHub 拒收 >100MB，不入库；渲染脚本和帧已按上面规则处理）
+promo/*.mp4
+
+# 机器人单实例锁（进程 PID，随启动/退出变化）
+.bot.pid
+
+# 群发任务与执行记录（运行时数据，每台机器各自一份）
+broadcast_tasks.json
+broadcast_tasks.json.tmp
+broadcast_tasks.json.lock
+
+# 关键词广告的运行时状态与命中记录（keyword_ads.json 配置本身随仓库走）
+keyword_ads_state.json
+keyword_ads_state.json.tmp
+keyword_ads_hits.jsonl*
+
+# 测试 / lint 缓存与 IDE 代理目录（不入库）
+.pytest_cache/
+.ruff_cache/
+.mrdayone/
+
+# PyInstaller 构建产物（packaging/ 只保留源码）
+packaging/build/
+packaging/dist/
+packaging/*.spec
+
