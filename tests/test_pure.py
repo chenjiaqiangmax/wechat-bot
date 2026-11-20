@@ -232,6 +232,38 @@ class TestSendRetry(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(len(calls), 1)
 
+    def test_unconfirmed_send_stops_retrying(self):
+        """「已尝试发送但结果未确认」不能重试：消息可能已经发出去了。
+
+        2026-11-20 真机实测：回车后消息其实已入库，但像素级确认（输入框
+        清空）没通过，旧实现当成普通失败又重发了两条，用户连撤两条。guia
+        层的约定本来就是「投递后未确认不得重新提交」，这里必须终止本轮，
+        答案留在待发，由恢复循环的 _reply_recorded 查库核对。
+        """
+        import dafeiyu_bot as m
+        old = m.SEND_RETRY_WAIT
+        m.SEND_RETRY_WAIT = 0
+        try:
+            calls = []
+
+            class _Unconfirmed:
+                is_success = False
+
+                def __str__(self):
+                    return "{'status': '失败', 'message': '" \
+                           + m.UNCONFIRMED_SEND_MARK + \
+                           "，为避免重复发送不再自动重试'}"
+
+            bot = self._bot()
+            ok, err = bot._send_retry(lambda: (calls.append(1), _Unconfirmed())[1],
+                                      '回答')
+            self.assertFalse(ok)
+            self.assertIn(m.UNCONFIRMED_SEND_MARK, err or '')
+            self.assertEqual(len(calls), 1,
+                             '未确认的发送被重试了——这就是重复发送的来源')
+        finally:
+            m.SEND_RETRY_WAIT = old
+
     def test_uia_unresponsive_keeps_answer_pending(self):
         """UIA 不响应时不能进 SendMsg：算临时失败，答案留在待发表。
 

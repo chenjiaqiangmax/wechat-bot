@@ -396,6 +396,7 @@ def broadcast_targets(q: str = '') -> list:
         if q and q.lower() not in name.lower() and q.lower() not in c['id'].lower():
             continue
         out.append({'id': c['id'], 'name': name, 'nick': '', 'remark': '',
+                    'alias': '',
                     'kind': 'group' if c.get('group') else 'user'})
         seen.add(c['id'])
     try:
@@ -416,6 +417,10 @@ def broadcast_targets(q: str = '') -> list:
                 # 前面，只有 name 分不出这一条是备注还是昵称。
                 'remark': (r.get('remark') or '').strip(),
                 'nick': (r.get('nick_name') or '').strip(),
+                # alias（微信号）也必须带出去：搜微信号时昵称/备注/username
+                # 都不含这个词，前端只按 name 过滤会把命中的这条再滤掉，
+                # 表现就是「按微信号搜不到」。
+                'alias': (r.get('alias') or '').strip(),
             })
             seen.add(uid)
     except Exception as e:
@@ -849,6 +854,12 @@ def build_conversations(events: list) -> list:
     不同群的回调在各自线程里跑，可能交错；按 FIFO 配对，绝大多数情况准确。
     """
     convs, pending = [], []
+    # 发送阶段的事件（[发送]/[待发]）挂在「最近一条已生成回复」的对话上：
+    # 它们出现在 [回复] 之后，此刻 pending 已空、中间可能插进了别的群的新
+    # 问题，挂 convs[-1] 会挂错对话。不挂的话「发出去了没有」在后台完全不
+    # 可见——2026-11-20 的重复发送事故里，对话记录只显示回复 ok，两次失败
+    # 重试和最终送达全都看不到。
+    last_replied = None
     # 多 Agent 之前的日志没有 <Agent> 前缀：算在兜底 Agent 头上
     fallback = next((a['name'] for a in load_agents() if '*' in (a.get('groups') or [])), '')
     for ev in events:
@@ -877,13 +888,20 @@ def build_conversations(events: list) -> list:
             else:
                 c['answer'] = body
                 c['status'] = 'ok'
+            last_replied = c
         elif tag in ('工具', '表情', 'say', 'ChatGPT', 'agent', '!!!', 'llm') and pending:
             pending[0]['steps'].append({'time': ev['t'].strftime('%H:%M:%S'),
                                         'tag': tag, 'body': body})
             if tag == '!!!':
                 pending[0]['status'] = 'fail'
-        elif tag == '!!!' and convs and '发送失败' in body:
-            convs[-1]['status'] = 'fail'          # 回复生成了但没发出去
+        elif tag == '!!!' and convs and ('发送失败' in body or '停止重试' in body):
+            (last_replied or convs[-1])['status'] = 'fail'   # 回复生成了但没发出去
+        elif tag in ('发送', '待发') and last_replied is not None:
+            # 发送阶段的成败与最终送达：没有这几行，后台看不出「发出去了没有」
+            last_replied['steps'].append({'time': ev['t'].strftime('%H:%M:%S'),
+                                          'tag': tag, 'body': body})
+            if tag == '发送' and '已发出' in body:
+                last_replied['status'] = 'ok'
     return convs
 
 

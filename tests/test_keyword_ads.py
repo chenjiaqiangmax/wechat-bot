@@ -385,6 +385,24 @@ class TestBotWiring(KeywordAdsTestBase):
             return True, None
 
         self.bot._send_retry = fake_retry
+        # 本类测的是「真 @ 接线」。ENABLE_UIA 关掉时 on_message 会走纯文本
+        # 降级（真 @ 依赖 UIA 认人），那是另一条路径，由
+        # test_uia_disabled_degrades_to_plain_text 单独覆盖。
+        from wechatauto.param import WxParam
+        self._saved_uia = WxParam.ENABLE_UIA
+        WxParam.ENABLE_UIA = True
+        self.addCleanup(setattr, WxParam, 'ENABLE_UIA', self._saved_uia)
+
+    def test_uia_disabled_degrades_to_plain_text(self):
+        """关掉 UIA 后真 @ 做不了，广告要降级为纯文本前缀照常发出去。"""
+        from wechatauto.param import WxParam
+        WxParam.ENABLE_UIA = False
+        chat = _FakeChat()
+        self.bot.on_message(_FakeMsg('有没有便宜的 token 渠道'), chat)
+        self.assertEqual(len(chat.calls), 1)
+        text, kw = chat.calls[0]
+        self.assertTrue(text.startswith('@张三 '), text)
+        self.assertEqual(kw, {'verify': True})
 
     def test_hit_sends_and_logs(self):
         chat = _FakeChat()

@@ -1316,7 +1316,8 @@ function bcNorm(s) { return String(s == null ? '' : s).toLowerCase().replace(/\s
 function bcHit(x, q) {
   if (!q) return true;
   return bcNorm(x.name).includes(q) || bcNorm(x.remark).includes(q)
-      || bcNorm(x.nick).includes(q) || bcNorm(x.id).includes(q);
+      || bcNorm(x.nick).includes(q) || bcNorm(x.id).includes(q)
+      || bcNorm(x.alias).includes(q);
 }
 
 /** 某类某侧当前可见的条目（搜索过滤后）。渲染和全选都走它，保证全选只作用于可见项。 */
@@ -1347,16 +1348,44 @@ function bcTfQuery(kind, val) {
 async function bcTfSupplement(kind, q) {
   try {
     const r = await api('/api/broadcast/targets?q=' + encodeURIComponent(q));
+    const hits = (r.targets || []).filter(x => (x.kind === 'group' ? 'group' : 'user') === kind);
     let added = 0;
-    for (const x of (r.targets || [])) {
-      const k = x.kind === 'group' ? 'group' : 'user';
-      if (k !== kind || bcSel[kind].has(x.id)) continue;
+    for (const x of hits) {
+      if (bcSel[kind].has(x.id)) continue;
       if (bcPool[kind].some(y => y.id === x.id)) continue;
       bcPool[kind].push(x);
       added++;
     }
     if (added) bcTfRender();
+    // 按微信号搜到唯一一个人时直接选中：微信号唯一，用户输它就是要找这个人，
+    // 再让他手动勾一下只是多一步。搜索词已经变了（他接着在打字）就不动。
+    if (kind === 'user' && bcNorm(bcQuery[kind]) === bcNorm(q)) {
+      const byAlias = hits.filter(x => x.alias && bcNorm(x.alias) === bcNorm(q));
+      if (byAlias.length === 1) bcTfPick('user', byAlias[0]);
+    }
   } catch (e) { /* 补查失败就按本地结果展示，不打断操作 */ }
+}
+
+/** 把一条目标直接放进「已选」并清空搜索框，省掉手动勾选 + 移动。 */
+function bcTfPick(kind, x) {
+  if (bcSel[kind].has(x.id)) {
+    bcQuery[kind] = '';
+    const dup = $('#bc-q-' + kind);
+    if (dup) dup.value = '';
+    bcTfRender();
+    toast(`${x.name || x.id} 已在已选里`, 'ok');
+    return;
+  }
+  bcSel[kind].set(x.id, { id: x.id, name: x.name || x.id, nick: x.nick || '',
+                          remark: x.remark || '', alias: x.alias || '', kind });
+  bcPool[kind] = bcPool[kind].filter(y => y.id !== x.id);
+  bcChecked.pool[kind].delete(x.id);
+  bcHot[kind] = '';
+  bcQuery[kind] = '';
+  const box = $('#bc-q-' + kind);
+  if (box) box.value = '';
+  bcTfRender();
+  toast(`已选中 ${x.name || x.id}`, 'ok');
 }
 
 /* ---------- 渲染与移动 ---------- */
@@ -1441,7 +1470,7 @@ function bcTfMove(kind, dir) {
       const x = bcPool[kind].find(y => y.id === id);
       if (!x) continue;
       bcSel[kind].set(id, { id, name: x.name || id, nick: x.nick || '',
-                            remark: x.remark || '', kind });
+                            remark: x.remark || '', alias: x.alias || '', kind });
       bcPool[kind] = bcPool[kind].filter(y => y.id !== id);
     } else {
       const x = bcSel[kind].get(id);
@@ -2160,6 +2189,12 @@ function renderUsage(d) {
 }
 let useResize;
 window.addEventListener('resize', () => { clearTimeout(useResize); useResize = setTimeout(() => { if (current() === 'usage' && useData) renderUsage(useData); }, 150); });
+// 浏览器切回标签页时立刻补拉一次日志：后台标签的 setTimeout 会被浏览器
+// 节流到分钟级，切回来若不主动补一次，实时日志看起来就像「停在了旧内容」。
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && current() === 'logs') pollLog();
+  if (!document.hidden && current() === 'home') loadStatus();
+});
 function toggleUseTable() { $('#useTable').hidden = !$('#useTable').hidden; }
 function niceMax(v) { if (v <= 0) return 1; const p = 10 ** Math.floor(Math.log10(v)), n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; }
 function showTip(tip, wrap, evt, html) {

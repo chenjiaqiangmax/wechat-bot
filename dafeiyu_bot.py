@@ -39,6 +39,7 @@ import urllib.request
 from collections import deque
 
 from wechatauto import WeChat
+from wechatauto.param import WxParam
 
 import broadcast
 import keyword_ads
@@ -231,6 +232,12 @@ TEST_HANG_SEND = float(os.environ.get("WECHAT_DEEPSEEK_TEST_HANG_SEND", "0"))
 # 命中时保留待发答案、不暂停机器人；桌面恢复后自动补发，重启也不丢。
 # 文案必须与 _send_retry 里提前 return 的字符串对得上。
 SKIP_SEND_REASONS = ('会话不可交互', '未恢复', '桌面不可读', 'UIA 无响应', '窗口不可见')
+# guia 在「回车/点击已投递、但像素级确认失败」时返回的固定文案。这种失败
+# 意味着消息可能已经发出去了——重试就是重复发送（2026-11-20 实测：第一条
+# 其实已入库，重试又发了两条，用户连撤两条）。见到就终止本轮；答案留在
+# 待发，恢复循环的 _reply_recorded 会查库核对：已发出的标记送达，真漏掉
+# 的由下一轮补发。
+UNCONFIRMED_SEND_MARK = '已尝试发送但结果未确认'
 CHATGPT_RETRY_WAIT = 5      # 两次尝试之间的间隔（秒）
 CHATGPT_TIMEOUT = 240       # ask / image 等回答的超时（秒），4 分钟
 CHATGPT_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1843,6 +1850,14 @@ class DaFeiYuBot:
                 return True, None
             if not raised:
                 last = str(r)
+            # 「已尝试发送但结果未确认」= 回车/点击已投递，消息可能已经出去。
+            # 重试就是重复发送（2026-11-20 实测连发两条被用户连撤两条），
+            # 所以这类失败绝不再试：终止本轮，答案留在待发，恢复循环的
+            # _reply_recorded 会查库核对——已发出的标记送达，真漏掉的补发。
+            if UNCONFIRMED_SEND_MARK in last:
+                print(f'[发送] {desc}结果未确认（可能已发出），终止重试；'
+                      f'答案保留待发，下一轮查库核对后决定是否补发', flush=True)
+                return False, last
             if i < attempts - 1:
                 print(f'[发送] {desc}失败（{last}），{SEND_RETRY_WAIT}s 后'
                       f'重试第 {i + 2}/{attempts} 次', flush=True)
@@ -2276,15 +2291,27 @@ class DaFeiYuBot:
             # 先占冷却再发：发送失败也不让下一条命中消息继续撞卡住的窗口
             engine.note_sent(chat_id, reply)
             t0 = time.time()
-            ok, err = self._send_retry(
-                lambda: chat.SendMsg(reply, at=at_name, verify=True),
-                '关键词广告', retries=0)
+            # 真 @ 依赖 UIA 认人（弹层读不出名字、真 @ token 只有 ValuePattern
+            # 能读到）。ENABLE_UIA 关掉后真 @ 必然失败，这里降级成纯文本前缀，
+            # 至少把广告发出去——代价是对方收不到 @ 提醒。
+            if not WxParam.ENABLE_UIA:
+                plain = f'@{at_name} {reply}'
+                ok, err = self._send_retry(
+                    lambda: chat.SendMsg(plain, verify=True),
+                    '关键词广告', retries=0)
+                at_mode = 'plain_text'
+            else:
+                ok, err = self._send_retry(
+                    lambda: chat.SendMsg(reply, at=at_name, verify=True),
+                    '关键词广告', retries=0)
+                at_mode = 'mention' 
             typing_ms = int((time.time() - t0) * 1000)
             print(f'[关键词广告] {where} 命中「{kws}」-> '
                   f'{"已发送" if ok else err} ({typing_ms / 1000:.1f}s)',
                   flush=True)
             engine.log_hit({**base, 'at_name': at_name,
                             'typing_ms': typing_ms, 'reply': reply,
+                            'at_mode': at_mode,
                             'result': 'sent' if ok else 'failed',
                             'error': (err or '')[:200]})
         except Exception:
