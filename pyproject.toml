@@ -46,6 +46,9 @@ dependencies = [
     "zstandard>=0.19.0",
     "pyautogui>=0.9.53",
     "opencv-python>=4.8.0",
+    # WGC（Windows Graphics Capture）截图：取 DWM 合成后的窗口表面，
+    # 窗口被其他窗口遮挡时也能拿到真实画面，给 OCR 兜底路径用。
+    "windows-capture>=2.0.1; sys_platform == 'win32'",
 ]
 
 [project.scripts]

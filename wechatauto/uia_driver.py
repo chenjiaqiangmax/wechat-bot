@@ -536,7 +536,8 @@ class WeChatUIA:
         time.sleep(0.25)
 
     def _wait_main(self, timeout: float, allow_login: bool = True,
-                   allow_accessibility_wake: bool = True):
+                   allow_accessibility_wake: bool = True,
+                   activate: bool = True):
         deadline = time.time() + max(timeout, 15)
         last_wake = 0.0
         last_pull = time.time()
@@ -546,7 +547,8 @@ class WeChatUIA:
             w = self._find_main()
             if w is not None:
                 self._win = w
-                self._activate(w)
+                if activate:
+                    self._activate(w)
                 return w
             if (allow_accessibility_wake and self._login_window() is None
                     and self._candidate_hwnds() and time.time() - last_wake > 5):
@@ -639,18 +641,36 @@ class WeChatUIA:
                 return False
             time.sleep(0.5)
 
-    def ensure_window(self, wake: bool = True, timeout: Optional[float] = None) -> bool:
-        """确保可访问的绑定窗口存在并置前，返回是否成功。
+    def ensure_window(self, wake: bool = True, timeout: Optional[float] = None,
+                      activate: bool = False) -> bool:
+        """确保可访问的绑定窗口存在，返回是否成功（默认**不抢前台**）。
 
         优先 ControlFromHandle 按句柄锚定拿 mmui 树；若树未物化（只剩 Qt
         外壳）则对当前 Weixin 进程热激活，不重启微信。任一环节失败返回
         False，由调用方降级到 OCR。
+
+        默认 ``activate=False``：只在窗口最小化时还原，**不抢前台**。发送路径
+        全程用 UIA 写值 + PostMessage 投递，不需要窗口在前台；只有必须走
+        真实鼠标键盘的旧路径才显式传 ``activate=True``。
         """
         timeout = timeout or self.timeout
         w = self._find_main()
         if w is not None:
             self._win = w
-            self._activate(w)
+            try:
+                fg = ctypes.windll.user32.GetForegroundWindow()
+                if fg and fg != w.NativeWindowHandle:
+                    self._user_fg = fg
+            except Exception:
+                pass
+            if activate:
+                self._activate(w)
+            else:
+                try:
+                    if self._input._user32.IsIconic(w.NativeWindowHandle):
+                        w.ShowWindow(9)
+                except Exception:
+                    pass
             return True
         self._win = None
         if not wake:
@@ -671,7 +691,7 @@ class WeChatUIA:
                 self._warn_gate_blocked(scan)
                 self._set_screen_reader_flag(True)
                 self.wake()
-            self._wait_main(timeout)
+            self._wait_main(timeout, activate=activate)
             return self._win is not None
         except UIATimeout:
             return False
@@ -954,7 +974,7 @@ class WeChatUIA:
         if box is not None or not expand:
             return box
         btn = self._search_button(win)
-        if btn is None or not self._click_ctrl(btn):
+        if btn is None or not self._post_click_ctrl(btn):
             return None
         for _ in range(4):
             time.sleep(0.3)
@@ -1226,7 +1246,7 @@ class WeChatUIA:
         for n in range(1, max(1, int(max_clicks)) + 1):
             wxlog.debug("点导航栏「%s」栏第 %d 次，确保主窗回到聊天页/退出当前会话",
                         CHAT_TAB_NAME, n)
-            if not self._click_ctrl(item):
+            if not self._post_click_ctrl(item):
                 return False
             rhythm.nap(settle)
             if _ready():
@@ -1266,7 +1286,7 @@ class WeChatUIA:
         传入 username/wxid 时自动映射为昵称/备注/微信号再搜索（微信搜索框
         不认 wxid）。搜索框残留会影响命中，每次打开前先清空重试。
         """
-        if not self.ensure_window():
+        if not self.ensure_window(activate=False):
             return False
         win = self._win
         if win.ClassName in HISTORY_WINDOW_CLASSES:
@@ -1303,11 +1323,11 @@ class WeChatUIA:
                         if not wrote:
                             self._paste_into(box, word, clear=True)
                     else:
-                        # 重试必须换真实粘贴：SetValue 只改 UIA 的 Value，
-                        # 微信未必据此发起搜索（2026-11-14 实测：3 个候选词
-                        # 全走 SetValue 时一个结果都没出来，耗时 32 秒）。
-                        wrote = False
-                        self._paste_into(box, word, clear=True)
+                        # 优先 WM_CHAR：消息投递，不需要窗口在前台、不移动光标，
+                        # 实测能触发微信搜索（2026-11-19）。失败才回退真实粘贴。
+                        wrote = self._type_into(box, word)
+                        if not wrote:
+                            self._paste_into(box, word, clear=True)
                     wxlog.debug("搜索词 %r 用 %s 写入", word,
                                 "SetValue" if wrote else "粘贴")
                     rhythm.nap(0.8)
@@ -1355,7 +1375,8 @@ class WeChatUIA:
                 results = exact
 
         chosen = results[0]
-        self._click_ctrl(chosen["cell"])
+        if not self._post_click_ctrl(chosen["cell"]):
+            self._click_ctrl(chosen["cell"])
         # 点开会话是异步的：固定等 0.7 秒时 current_chat() 读到的可能还是旧
         # 会话，于是明明点开了却被判成失败（2026-11-14 实测第一次 open_chat
         # 返回 False，31.7 秒；第二次才 True）。按结果名轮询最多 3 秒。
@@ -1370,13 +1391,192 @@ class WeChatUIA:
                     chosen["name"], used_kw)
         return False
 
+    # ------------------------------------------------------------------
+    # 发送：写值 + PostMessage 点发送按钮
+    # ------------------------------------------------------------------
+    def _click_target_hwnd_at(self, x: int, y: int) -> int:
+        """找覆盖该屏幕点、**面积最小**的微信顶层窗口（弹层优先于主窗口）。
+
+        微信的搜索下拉、@ 弹层都是独立的顶层窗口（实测搜索弹层是
+        ``Qt51514QWindowToolSaveBits``，单独一个 hwnd）。一律投给主窗口会让
+        坐标落在主窗口的会话列表上，把会话切到别处。这里枚举微信进程的全部
+        可见顶层窗口，按面积从小到大取，不依赖窗口是否在前台——``WindowFromPoint``
+        在窗口被遮挡时返回的是遮挡窗口，不能用。
+        """
+        u = ctypes.windll.user32
+        if self._win is None:
+            return 0
+        from wechatauto.utils.win32 import enum_windows_by_pid
+        pid = ctypes.wintypes.DWORD()
+        u.GetWindowThreadProcessId(self._win.NativeWindowHandle, ctypes.byref(pid))
+        best = []
+        for hwnd in enum_windows_by_pid(int(pid.value)):
+            rr = ctypes.wintypes.RECT()
+            u.GetWindowRect(hwnd, ctypes.byref(rr))
+            if rr.left <= x <= rr.right and rr.top <= y <= rr.bottom:
+                area = (rr.right - rr.left) * (rr.bottom - rr.top)
+                best.append((area, hwnd))
+        if not best:
+            return self._win.NativeWindowHandle
+        best.sort()
+        return int(best[0][1])
+
+    def _post_click_at(self, x: int, y: int, hwnd: int = 0) -> bool:
+        """把鼠标点击消息投递给指定窗口，不移动真实光标。
+
+        ``hwnd`` 为空时按落点自动选最具体的微信窗口（弹层优先），这是搜索
+        结果、@ 弹层能点中的前提。
+        """
+        u = ctypes.windll.user32
+        target = hwnd or self._click_target_hwnd_at(x, y)
+        if not target:
+            return False
+        client = ctypes.wintypes.POINT(int(x), int(y))
+        u.ScreenToClient(target, ctypes.byref(client))
+        lp = (client.y << 16) | (client.x & 0xFFFF)
+        u.PostMessageW(target, 0x0201, 1, lp)
+        time.sleep(0.04)
+        u.PostMessageW(target, 0x0202, 0, lp)
+        return True
+
+    def _ctrl_root_hwnd(self, ctrl) -> int:
+        """控件所属顶层窗口的句柄；取不到时退回主窗口。"""
+        for getter in (lambda: ctrl.top_level_parent().handle,
+                       lambda: ctrl.NativeWindowHandle):
+            try:
+                h = getter()
+            except Exception:
+                continue
+            if h:
+                root = ctypes.windll.user32.GetAncestor(int(h), 2)  # GA_ROOT
+                return int(root or h)
+        return self._win.NativeWindowHandle if self._win is not None else 0
+
+    def _post_click_ctrl(self, ctrl) -> bool:
+        """点控件矩形中心（消息投递，不碰真实鼠标、不按落点反查窗口）。"""
+        try:
+            r = ctrl.BoundingRectangle
+        except Exception:
+            return False
+        if not r or r.width() <= 0 or r.height() <= 0:
+            return False
+        # 不指定 hwnd：按落点自动选最具体的微信窗口（搜索/＠ 弹层优先）。
+        # 微信控件收到点击会自己激活窗口（拦不住），所以每一次控件点击之后
+        # 都立刻把前台还给点击前的窗口；放在这里而不是各调用点，是为了不
+        # 漏掉搜索框、搜索弹层、@ 弹层这些零散的点击。
+        prev_fg = ctypes.windll.user32.GetForegroundWindow()
+        ok = self._post_click_at((r.left + r.right) // 2,
+                                 (r.top + r.bottom) // 2)
+        self._restore_foreground(prev_fg)
+        return ok
+
+    def _restore_foreground(self, prev_fg: int) -> None:
+        """把前台还给用户的窗口。
+
+        微信控件收到鼠标消息后会自己 ``SetForegroundWindow``（实测
+        ``Invoke`` / ``Select`` / ``PostMessage`` 三种都触发，``WS_EX_NOACTIVATE``
+        也拦不住），所以在每次点击之后立刻把前台还回去。
+
+        ``prev_fg`` 不可靠：连续点击时它常常已经是微信（上一轮点击留下的），
+        所以当它是微信或为空时改用 ``_user_fg``——初始化时记住的那个用户窗口。
+        """
+        wx_h = self._win.NativeWindowHandle if self._win is not None else 0
+        if not prev_fg or prev_fg == wx_h:
+            prev_fg = getattr(self, '_user_fg', 0)
+        if not prev_fg or prev_fg == wx_h:
+            return
+        u = ctypes.windll.user32
+        if u.GetForegroundWindow() == prev_fg:
+            return
+        time.sleep(0.2)
+        try:
+            cur = ctypes.windll.kernel32.GetCurrentThreadId()
+            tid = u.GetWindowThreadProcessId(prev_fg, None)
+            if tid:
+                u.AttachThreadInput(cur, tid, True)
+            u.SetForegroundWindow(prev_fg)
+            if tid:
+                u.AttachThreadInput(cur, tid, False)
+        except Exception:
+            pass
+
+    def _send_button(self):
+        """定位「发送」按钮；30 秒内复用结果，避免每次全树遍历。"""
+        cache = getattr(self, '_send_btn_cache', None)
+        if cache is not None and time.time() - cache[1] < 30.0:
+            return cache[0]
+        btn = _find_by(self._win,
+                       lambda c: (c.ControlTypeName == 'ButtonControl'
+                                  and (c.Name or '') == '发送'),
+                       max_depth=30, max_nodes=4000)
+        if btn is not None:
+            self._send_btn_cache = (btn, time.time())
+        return btn
+
+    def send_via_button(self, text: str) -> bool:
+        """用 UIA 写值 + PostMessage 点发送按钮发一条文本。
+
+        与逐字键入相比不移动真实鼠标、不逐字打字；代价是微信自己在写值和
+        点击时激活窗口一次（实测 Invoke/Select/PostMessage 都会触发，是
+        微信控件自身的行为，外部拦不住）。发送结束后把前台还给原来的窗口，
+        让用户只看到一次短暂闪烁而不是被切走。
+        """
+        self._send_attempted = False
+        if not self.ensure_window(activate=False):
+            return False
+        u = ctypes.windll.user32
+        prev_fg = u.GetForegroundWindow()
+        e = self._chat_input()
+        if e is None:
+            return False
+        self._post_click_ctrl(e)
+        time.sleep(0.3)
+        try:
+            e.GetValuePattern().SetValue(text)
+        except Exception as exc:
+            wxlog.debug('SetValue 写入失败：%s', exc)
+            return False
+        time.sleep(0.25)
+        ok, got, score = self._paste_landed(e, text)
+        if not ok:
+            self._chat_input_cache = None
+            wxlog.warning(
+                'SetValue 未落进输入框（相似度 %.2f < 阈值 %.2f），不发送；读回=%r',
+                score, float(WxParam.SEND_CONTENT_RATIO), (got or '')[:80])
+            try:
+                e.GetValuePattern().SetValue('')
+            except Exception:
+                pass
+            return False
+        btn = self._send_button()
+        self._send_attempted = True
+        if btn is None:
+            wxlog.warning('找不到发送按钮，回退回车')
+            try:
+                e.SendKeys("{Enter}", waitTime=0.05)
+            except Exception:
+                return False
+        elif not self._post_click_ctrl(btn):
+            return False
+        # 微信激活窗口后把前台还回去：不改窗口位置，只恢复焦点归属
+        if prev_fg and prev_fg != self._win.NativeWindowHandle:
+            self._restore_foreground(prev_fg)
+        return True
+
     def send_text(self, text: str) -> bool:
         """在已打开会话的输入框发送文本。返回是否成功。
+
+        ``WxParam.SEND_VIA_POSTMESSAGE`` 打开时走 :meth:`send_via_button`
+        （写值 + PostMessage 点发送按钮），否则走原来的逐字键入 + 回车。
 
         回车之前先回读输入框内容比对（阈值 ``WxParam.SEND_CONTENT_RATIO``）：
         Ctrl+V 有可能整个落空（焦点没落到输入框上），这时按键照样打下去，
         发出去的会是空消息或上一轮残留的内容。判不达标就不回车并清空。
         """
+        if WxParam.SEND_VIA_POSTMESSAGE:
+            if self.send_via_button(text):
+                return True
+            wxlog.debug('send_via_button 未成功，回退逐字键入 + 回车')
         self._send_attempted = False
         if not self.ensure_window():
             return False
@@ -1735,6 +1935,35 @@ class WeChatUIA:
             return False
         time.sleep(0.1)
         return True
+
+    def _type_into(self, ctrl, text: str) -> bool:
+        """用 WM_CHAR 往控件里逐字投递，不移动光标、不要求窗口在前台。
+
+        先用 ValuePattern 清空（它只改值、不触发搜索），再点一下控件拿焦点，
+        然后按 UTF-16 码元投递 WM_CHAR。投完读回确认。换行与 emoji 会被
+        微信丢弃（2026-11-19 实测），这类文本由调用方改用别的路径。
+        """
+        if not text:
+            return True
+        try:
+            ctrl.GetValuePattern().SetValue('')
+        except Exception:
+            pass
+        if not self._post_click_ctrl(ctrl):
+            return False
+        time.sleep(0.15)
+        hwnd = self._win.NativeWindowHandle
+        if not hwnd:
+            return False
+        data = text.encode('utf-16-le')
+        for i in range(0, len(data), 2):
+            cp = int.from_bytes(data[i:i + 2], 'little')
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0102, cp, 1)
+            # 间隔太短会丢字：0.01s 投 10 个字只进去 3 个（2026-11-19 实测）。
+            time.sleep(0.035)
+        time.sleep(0.25)
+        got = self._read_edit_value(ctrl)
+        return bool(got) and text in (got or '')
 
     def _paste_into(self, ctrl, text: str, clear: bool = True) -> None:
         """点击控件拿焦点，再走剪贴板 Ctrl+V（发送类输入框用这条）。"""

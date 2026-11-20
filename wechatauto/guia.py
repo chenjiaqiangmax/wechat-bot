@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import functools
 import json
 import os
 import platform
@@ -151,8 +152,21 @@ WX_RENDER_WIN_CLASS_PREFIX = "MMUIRenderSubWindow"
 SIDEBAR_LEFT = 0
 SIDEBAR_RATIO = 0.22                     # 侧栏宽度 / 窗口宽度
 SIDEBAR_TOP = 0.05                       # 会话列表顶部起始（相对窗口高）
-SEARCH_BOX_RATIO = (0.18, 0.041, 0.86, 0.079)  # (x0,y0,x1,y1)，x 相对侧栏宽、y 相对窗口高
+# 搜索框在整个窗口里的位置（x 相对窗口宽、y 相对窗口高）。2026-11-20 实测
+# 900x650 的微信 4.x 窗口：搜索框在 (68,38)-(238,70)，**比侧栏（198）还宽**，
+# 所以横向不能用 sidebar_right 做基准——旧值算出来是 (35,26)-(170,51)，
+# 点击落在搜索框上方的空白区，搜索从未真正生效。
+SEARCH_BOX_RATIO = (0.076, 0.058, 0.264, 0.108)
 SEND_BUTTON_RATIO = (0.78, 0.92, 0.995, 0.99)  # 「发送」按钮检索区（相对窗口）
+# 输入框文字区的最小高度（相对窗口高）。2026-11-20 实测 900x650 的微信窗口里
+# 只有约 70px（0.108），原来写死 150px 的判据永远匹配不上，导致关掉 UIA 后
+# 输入框定位必然失败、整条发送链路不可用。
+INPUT_BOX_MIN_H_RATIO = 0.06
+# 输入框文字区的位置比例 (x0, y0, x1, y1)，x 相对渲染宽、y 相对渲染高。
+# 只在「像素探针 + 重校准」都定位不到时兜底用：2026-11-20 实测文件传输助手
+# 会话的消息区中线全白、没有那条约 2px 的灰分界线，探针的判据必然不成立。
+# 数值取自实测（900x650 窗口里输入框约 y=525..595）。
+INPUT_BOX_RATIO = (0.22, 0.80, 1.0, 0.92)
 
 # 「代码本身坏了」和「这次没测出来」不是一回事：前者必须上屏，后者可以静默回落。
 # 少了这层区分时，一个缺 import 的 NameError 会被宽 except 伪装成 OCR 未命中。
@@ -256,10 +270,33 @@ def _restore_keep_maximize(user32, hwnd: int):
 
 
 def window_owner_pid(x: int, y: int) -> Optional[int]:
-    """屏幕坐标 (x, y) 处最上层窗口所属的进程 id；探测失败返回 None。"""
+    """屏幕坐标 (x, y) 处最上层窗口所属的进程 id；探测失败返回 None。
+
+    跳过 ``WS_EX_TRANSPARENT`` 的窗口：鼠标事件会穿透它们落到下面，但
+    ``WindowFromPoint`` 仍返回它。2026-11-20 实测 IDE 的 WebView 子窗口
+    （``Chrome_RenderWidgetHostHWND``，进程 msedgewebview2）就是这样盖在
+    微信上方，旧实现据此判定「落点不属于微信」而放弃投递。
+    """
     try:
         u = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x00000020
+        GA_ROOT = 2
+        GW_HWNDNEXT = 2
         hwnd = u.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+        hops = 0
+        while hwnd and hops < 64:
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
+            if not ex & WS_EX_TRANSPARENT:
+                break
+            # 透明的可能是个子窗口；先看它所属的顶层窗口，再沿 z 序往下找。
+            root = u.GetAncestor(hwnd, GA_ROOT) or hwnd
+            root_ex = u.GetWindowLongW(root, GWL_EXSTYLE) & 0xFFFFFFFF
+            if not root_ex & WS_EX_TRANSPARENT:
+                hwnd = root
+                break
+            hwnd = u.GetWindow(root, GW_HWNDNEXT)
+            hops += 1
         if not hwnd:
             return None
         pid = wintypes.DWORD()
@@ -436,10 +473,17 @@ class ScreenOCR:
                     out = []
                     for line in res.lines:
                         text = line.text.replace(' ', '')
-                        if not text:
+                        if not text or not line.words:
                             continue
-                        r = line.words[0].bounding_rect
-                        out.append((text, int(r.x), int(r.y), int(r.width), int(r.height)))
+                        # 一行中文常被切成多个 word，只取 words[0] 会得到几像素的
+                        # 假宽度（2026-11-20 实测 8 个字的标题只报 w=14），所有
+                        # 按框中心点击的地方都会横向偏到左边。这里取整行并集。
+                        rects = [w.bounding_rect for w in line.words]
+                        x0 = min(int(r.x) for r in rects)
+                        y0 = min(int(r.y) for r in rects)
+                        x1 = max(int(r.x + r.width) for r in rects)
+                        y1 = max(int(r.y + r.height) for r in rects)
+                        out.append((text, x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
                     return out
                 finally:
                     s.close()
@@ -457,6 +501,378 @@ class ScreenOCR:
         except Exception as e:
             wxlog.debug(f'OCR 识别失败：{e}')
             return []
+
+
+def _row_white_ratio(pixels, y: int, x0: int, x1: int, step: int = 3) -> float:
+    """一行里接近白色的像素占比；采样步长控制扫描成本。"""
+    total = white = 0
+    for x in range(x0, x1, step):
+        total += 1
+        if sum(pixels[x, y][:3]) / 3 > 240:
+            white += 1
+    return white / total if total else 0.0
+
+
+def _input_box_rows_from_frame(frame: Image.Image, right_pane_left: int):
+    """返回 (pixels, width, height, {y: 行白率})；不满足基本条件时返回 None。"""
+    if frame.mode != 'RGB':
+        frame = frame.convert('RGB')
+    width, height = frame.size
+    if width <= 0 or height <= 0 or not 0 <= right_pane_left < width:
+        return None
+    pixels = frame.load()
+    if pixels is None:
+        return None
+    scan_top = int(height * 0.45)
+    ratios = {y: _row_white_ratio(pixels, y, right_pane_left, width)
+              for y in range(scan_top, height)}
+    return pixels, width, height, ratios
+
+
+def _detect_input_box_from_frame(
+        frame: Image.Image,
+        right_pane_left: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """在一帧里找输入区：自下而上取白底区间，要求其上方有 1-6 行分隔线。
+
+    2026-11-20 实测 900x650 微信窗口：输入框底色是 250 而非纯白（行白率约
+    0.85），分隔线是两行 234/237 的浅灰。原来沿中心列向下扫，输入框里有
+    文字时会被字头截断，所以改成看整行白率。
+    """
+    parsed = _input_box_rows_from_frame(frame, right_pane_left)
+    if parsed is None:
+        return None
+    _, width, height, ratios = parsed
+    scan_top = int(height * 0.45)
+    min_height = int(height * INPUT_BOX_MIN_H_RATIO)
+
+    y = height - 1
+    while y >= scan_top:
+        if ratios.get(y, 0.0) < 0.6:
+            y -= 1
+            continue
+        bottom = y
+        top = bottom
+        while top - 1 >= scan_top and ratios.get(top - 1, 0.0) >= 0.6:
+            top -= 1
+        divider = 0
+        g = top - 1
+        while g >= scan_top and g >= top - 8 and ratios.get(g, 1.0) <= 0.35:
+            divider += 1
+            g -= 1
+        if (1 <= divider <= 6 and bottom - top + 1 >= min_height
+                and top >= int(height * 0.45)):
+            return right_pane_left, top, width, bottom + 1
+        y = top - 1
+    return None
+
+
+def _cached_input_box_matches_frame(
+        frame: Image.Image,
+        box: Tuple[int, int, int, int],
+        right_pane_left: int,
+) -> bool:
+    """只复用边界仍在当前帧可见的输入框矩形，防止窗口/草稿高度变化后误点。"""
+    x0, y0, x1, y1 = box
+    parsed = _input_box_rows_from_frame(frame, right_pane_left)
+    if parsed is None:
+        return False
+    _, width, height, ratios = parsed
+    if (x0 != right_pane_left or x1 != width or x0 >= x1
+            or y0 < int(height * 0.45) or y1 > height
+            or y1 - y0 < int(height * INPUT_BOX_MIN_H_RATIO)):
+        return False
+    if ratios.get(y0, 0.0) < 0.6 or ratios.get(y1 - 1, 0.0) < 0.6:
+        return False
+    divider = 0
+    g = y0 - 1
+    while g >= max(0, y0 - 6) and ratios.get(g, 1.0) <= 0.35:
+        divider += 1
+        g -= 1
+    return 1 <= divider <= 6
+
+
+def _chat_name_key(name: str) -> str:
+    """名字归一化：去空白、大小写、末尾的「（450）」这类计数。"""
+    key = ''.join((name or '').casefold().split())
+    return re.sub(r'[（(]\d+[)）]$', '', key)
+
+
+def _title_similar(a: str, b: str) -> bool:
+    """标题容错：允许 OCR 错一个字，但数字不同不算同一个名字。
+
+    实测标题里的「输」会被认成「蝓」；不放宽这一格，会话已经打开了也会被判
+    成没打开。数字必须排除，否则「目标群1」「目标群2」会互相冒充。
+    """
+    if a == b:
+        return True
+    if len(a) != len(b) or len(a) < 3:
+        return False
+    diffs = [(x, y) for x, y in zip(a, b) if x != y]
+    if len(diffs) != 1:
+        return False
+    x, y = diffs[0]
+    return not (x.isdigit() or y.isdigit())
+
+
+def _chat_name_score(ocr_name: str, target: str) -> int:
+    """给 OCR 会话名打分：3 完整相等，2 OCR 名是目标的一段，1 目标名是较长 OCR 名的一段。
+
+    保留原来 ``_name_matches`` 的截断容错（OCR 会吃掉首尾字符），但调用方要求
+    最高分的候选唯一，避免「文件」这类短片段把「文件传输助手」之外的行也算命中。
+    """
+    candidate = ''.join((ocr_name or '').casefold().split())
+    wanted = ''.join((target or '').casefold().split())
+    candidate = re.sub(r'[（(]\d+[)）]$', '', candidate)
+    wanted = re.sub(r'[（(]\d+[)）]$', '', wanted)
+    if not candidate or not wanted:
+        return 0
+    if candidate == wanted:
+        return 3
+    if candidate in wanted:
+        return 2
+    if wanted in candidate and len(candidate) >= 3:
+        index = candidate.index(wanted)
+        extra = candidate[:index] + candidate[index + len(wanted):]
+        # 多出来的若是数字/文字，就是另一个会话名（如「目标群2」），不是装饰。
+        if not re.search(r'[\w\u4e00-\u9fff]', extra):
+            return 1
+    return 0
+
+
+def _capture_window_frame(hwnd: int) -> Optional[Image.Image]:
+    """抓一个窗口的完整表面（WGC，与遮挡/层级无关）。
+
+    微信 4.x 把搜索下拉放在**独立顶层窗口**（实测类名
+    ``Qt51514QWindowToolSaveBits``）里，主窗帧永远拍不到它——这是搜索一直
+    「没有结果」的真正原因。只有对着那个 hwnd 单独抓帧才能看到候选。
+    """
+    try:
+        from windows_capture import WindowsCapture
+    except Exception:
+        return None
+    got: list = []
+    try:
+        cap = WindowsCapture(window_hwnd=hwnd, cursor_capture=None, draw_border=None)
+    except Exception as e:
+        wxlog.debug(f'窗口抓帧初始化失败：{type(e).__name__}: {e}')
+        return None
+
+    @cap.event
+    def on_frame_arrived(frame, cc):
+        got.append(frame.frame_buffer.copy())
+        cc.stop()
+
+    @cap.event
+    def on_closed():
+        pass
+
+    try:
+        ctrl = cap.start_free_threaded()
+    except Exception as e:
+        wxlog.debug(f'窗口抓帧启动失败：{type(e).__name__}: {e}')
+        return None
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not got:
+        time.sleep(0.03)
+    try:
+        ctrl.stop()
+    except Exception:
+        pass
+    time.sleep(0.08)
+    if not got:
+        return None
+    arr = got[0]
+    return Image.fromarray(arr[:, :, :3][:, :, ::-1])
+
+
+def _find_search_popup(
+        main_hwnd: int,
+) -> Optional[Tuple[int, Tuple[int, int, int, int]]]:
+    """返回搜索下拉浮层的 (hwnd, 屏幕矩形)；没打开时返回 None。
+
+    判据：同一进程、可见、类名含 ``ToolSaveBits``、且够大不像提示条。
+    """
+    get_pid = ctypes.windll.user32.GetWindowThreadProcessId
+    pid = ctypes.c_ulong()
+    get_pid(main_hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return None
+    found: list = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _callback(hwnd, _lparam):
+        owner = ctypes.c_ulong()
+        get_pid(hwnd, ctypes.byref(owner))
+        if owner.value != pid.value:
+            return True
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, cls, 256)
+        if 'ToolSaveBits' not in cls.value:
+            return True
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        if rect.right - rect.left < 120 or rect.bottom - rect.top < 120:
+            return True
+        found.append((int(hwnd), (rect.left, rect.top, rect.right, rect.bottom)))
+        return True
+
+    ctypes.windll.user32.EnumWindows(_callback, 0)
+    return found[0] if found else None
+
+
+# 搜索浮层里「功能 / 聊天记录」两段在上，「搜索网络结果」在下。点网络结果
+# 只会跳网页，不是打开会话，所以只在浮层上半部分找候选。
+SEARCH_POPUP_MAX_Y_RATIO = 0.62
+
+
+_SHARED_DB = None
+
+
+def _shared_db():
+    """共享一个 WeChatDB：构造一次约 0.77s，每开一个会话都新建太浪费。
+
+    查询失败由调用方兜底；切账号要重启进程，缓存随之失效。
+    """
+    global _SHARED_DB
+    if _SHARED_DB is None:
+        from .db import WeChatDB
+        _SHARED_DB = WeChatDB()
+    return _SHARED_DB
+
+
+def _alias_for_name(name: str):
+    """把会话显示名换成通讯录里的唯一微信号；拿不到返回 None。
+
+    微信搜索框只认显示名/备注/微信号，不认 wxid，所以打开会话终究要输入
+    一个名字。问题是单字昵称在通讯录里常常重名——实测「强」同时对应
+    ``chenjiaqiang97``（微信号 God-Cap）和一个陌生 wxid，搜「强」浮层里
+    出来两个人，只能靠 OCR 认名字，而侧栏/浮层的小字恰好认错。微信号
+    唯一且是 ASCII，OCR 不会读错，用它搜索浮层里只剩目标一个人。
+
+    只认同名（昵称或备注精确等于 name）且带微信号的联系人；同名对应多个
+    微信号、没有微信号、通讯录读不到时返回 None，调用方退回按名字搜索。
+    """
+    key = (name or '').strip()
+    if not key:
+        return None
+    try:
+        rows = _shared_db().search_contact(key, 200)
+    except Exception as exc:
+        wxlog.debug('通讯录查询失败，退回按名字搜索：%s', exc)
+        return None
+    aliases = {(r.get('alias') or '').strip()
+               for r in rows
+               if key in ((r.get('nick_name') or '').strip(),
+                          (r.get('remark') or '').strip())}
+    aliases.discard('')
+    return next(iter(aliases)) if len(aliases) == 1 else None
+
+
+def _display_name_for(name: str):
+    """username（wxid_* / 自定义号）→ 通讯录里的显示名；不是 username 返回 None。
+
+    机器人内部拿到的是 ``chat_id``（如 ``chenjiaqiang97``），直接丢进微信
+    搜索框搜不到人——2026-11-20 连发四次失败就是这个：日志里
+    ``query='chenjiaqiang97' alias=None``，浮层 4 行没有一条能匹配。
+    ``get_nickname`` 查不到时原样返回入参，所以「返回值 ≠ 入参」就说明它
+    确实是通讯录里的 username。
+    """
+    key = (name or '').strip()
+    if not key:
+        return None
+    try:
+        nick = _shared_db().get_nickname(key)
+    except Exception:
+        return None
+    return nick if nick and nick != key else None
+
+
+# 浮层里分区标题的位置：这些行以下就不是「联系人」了
+_POPUP_SECTION_TITLES = ('群聊', '公众号', '全部')
+
+
+def _popup_alias_row(rows: list, alias: str, frame_height: int):
+    """按微信号在搜索浮层里定位联系人。
+
+    搜微信号时联系人项在最上面，下面「群聊」区会列出「包含：昵称（微信号）」
+    的群——它们同样含这个 alias，点进去就发错地方。所以下界取第一个分区
+    标题的 y，只在其上找；没有分区标题时退回浮层上半区的比例上限。
+    同一 alias 命中多行时取最靠上的（联系人区在前）。
+    """
+    if not rows or frame_height <= 0:
+        return None
+    needle = (alias or '').strip().lower()
+    if len(needle) < 3:
+        return None
+    limit = frame_height * SEARCH_POPUP_MAX_Y_RATIO
+    for text, _x, y, _w, _h in rows:
+        label = (text or '').strip()
+        if any(t in label for t in _POPUP_SECTION_TITLES) and len(label) <= 8:
+            limit = min(limit, y)
+    hits = [row for row in rows
+            if row[2] < limit and needle in (row[0] or '').lower()]
+    return min(hits, key=lambda row: row[2]) if hits else None
+
+
+def _popup_result_row(rows: list, target: str, frame_height: int):
+    """在搜索浮层 OCR 结果里挑一行点；多行同分时取最靠上的（功能区在前）。
+
+    只收浮层上半部分：下面那段是「搜索网络结果」，点它只会跳网页，
+    不是打开会话。基准用浮层帧高，不能取 OCR 行最大 y——只读到一行候选时
+    那个基准会把唯一正确的行也排除掉。
+    """
+    if not rows or frame_height <= 0:
+        return None
+    limit = frame_height * SEARCH_POPUP_MAX_Y_RATIO
+    scored = []
+    for text, x, y, w, h in rows:
+        if y > limit:
+            continue
+        score = _chat_name_score(text, target)
+        if score:
+            scored.append((score, (text, x, y, w, h)))
+    if not scored:
+        return None
+    best = max(score for score, _row in scored)
+    top = [row for score, row in scored if score == best]
+    return sorted(top, key=lambda row: row[2])[0]
+
+
+def _best_session_row(rows: list, target: str) -> Optional[dict]:
+    """选择唯一最高分的可见会话行；同名并列时拒绝猜测。"""
+    ranked = [(score, row) for row in rows
+              if (score := _chat_name_score(str(row.get('name', '')), target))]
+    if not ranked:
+        return None
+    best_score = max(score for score, _ in ranked)
+    best = [row for score, row in ranked if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
+def _search_candidate_row(lines: list, target: str) -> Optional[tuple]:
+    """从搜索 OCR 行中选择唯一本地会话候选，忽略网络、成员预览和历史结果。"""
+    ranked = []
+    for text, x, y, w, h in sorted(lines, key=lambda row: (row[2], row[1])):
+        label = (text or '').strip()
+        if not label:
+            continue
+        if label.startswith(('搜索网络结果', '搜一搜', '聊天记录', '查看全部')):
+            break
+        if (label == '群聊' or label in ('联系人', '微信联系人')
+                or label.startswith('搜索') or '网络' in label
+                or '暂无' in label or '包含' in label):
+            continue
+        score = _chat_name_score(label, target)
+        if score:
+            ranked.append((score, (label, x, y, w, h)))
+    if not ranked:
+        return None
+    best_score = max(score for score, _ in ranked)
+    best = [row for score, row in ranked if score == best_score]
+    return best[0] if len(best) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +906,8 @@ class WeChatGUI:
         self._update_render_rect()
         self.pid = self._get_pid(self.main_hwnd)
         self._current_chat = None  # 最近打开的会话名，用于连续发送时复用
-        self._last_input_box = None  # 最近一次成功发送的输入框位置，连续发送复用
+        self._last_input_box = None  # 最近一次确认过的输入框位置
+        self._last_input_box_key = None  # 窗口/布局变化后拒绝复用旧坐标
         self._uia = None  # UIA 引擎（惰性创建，仅当可用时启用）
         self._uia_window_kind = None  # 已确认类型随窗口绑定保留，树退化时仍能拒绝误操作
         self._uia_tried = False
@@ -676,8 +1093,8 @@ class WeChatGUI:
             self.right_pane_left = self.sidebar_right
         sx0, sy0, sx1, sy1 = SEARCH_BOX_RATIO
         self.search_box = (
-            int(self.sidebar_right * sx0), int(self.render_h * sy0),
-            int(self.sidebar_right * sx1), int(self.render_h * sy1))
+            int(self.render_w * sx0), int(self.render_h * sy0),
+            int(self.render_w * sx1), int(self.render_h * sy1))
         bx0, by0, bx1, by1 = send_ratio
         self.send_button_region = (
             int(self.render_w * bx0), int(self.render_h * by0),
@@ -909,6 +1326,7 @@ class WeChatGUI:
             self._uia_check_ts = 0.0
             self._uia_window_kind = None
             self._last_input_box = None
+            self._last_input_box_key = None
             self._current_chat = None
             self._pending_text = None
             self._cached_db = None
@@ -920,15 +1338,13 @@ class WeChatGUI:
         return True
 
     def _find_chat_window(self, name: str) -> int:
-        """在当前微信进程的所有可见窗口中，找标题含 name 前2字与“聊天记录”的独立聊天窗。"""
+        """只返回标题包含完整目标名的唯一独立聊天窗，歧义时返回 0。"""
         u = self._input._user32
         wx_pid = self._get_pid(self.main_hwnd)
-        frag = name[:2]
-        found = 0
+        found = []
         cb_ref = []
 
         def _cb(h, lp):
-            nonlocal found
             pid = wintypes.DWORD()
             u.GetWindowThreadProcessId(h, ctypes.byref(pid))
             if pid.value != wx_pid or not u.IsWindowVisible(h):
@@ -936,15 +1352,20 @@ class WeChatGUI:
             buf = ctypes.create_unicode_buffer(256)
             u.GetWindowTextW(h, buf, 256)
             title = buf.value
-            if title and '聊天记录' in title and frag in title:
-                found = h
-                return False
+            if title and '聊天记录' in title:
+                score = _chat_name_score(title, name)
+                if score:
+                    found.append((score, h))
             return True
 
         CB = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         cb_ref.append(CB(_cb))
         u.EnumWindows(cb_ref[0], 0)
-        return found
+        if not found:
+            return 0
+        best_score = max(score for score, _ in found)
+        best = [hwnd for score, hwnd in found if score == best_score]
+        return best[0] if len(best) == 1 else 0
 
     def is_alive(self) -> bool:
         return bool(self._input._user32.IsWindow(self.main_hwnd))
@@ -985,9 +1406,13 @@ class WeChatGUI:
             if fg == self.main_hwnd and not u.IsIconic(self.main_hwnd):
                 break
             tid_fg = u.GetWindowThreadProcessId(fg, None) if fg else 0
-            tid_t = u.GetWindowThreadProcessId(self.main_hwnd, None)
+            # 必须把「调用线程」附加到「前台线程」：SetForegroundWindow 的
+            # 前台权限是按调用线程算的。写成附加(前台, 微信) 时调用线程
+            # 并不在链上，Windows 不报错、只闪任务栏，GetForegroundWindow
+            # 仍返回原窗口——这正是「微信窗口不可见」反复出现的根因。
+            tid_cur = ctypes.windll.kernel32.GetCurrentThreadId()
             if tid_fg:
-                u.AttachThreadInput(tid_fg, tid_t, True)
+                u.AttachThreadInput(tid_cur, tid_fg, True)
             _restore_keep_maximize(u, self.main_hwnd)
             # HWND_TOPMOST 必须用 c_void_p(-1)：裸传 -1 会被 ctypes 当 32 位整数
             # 送进 64 位 HWND 参数，SetWindowPos 直接返回 0（实测 last_error 1400），
@@ -1000,7 +1425,7 @@ class WeChatGUI:
             if self.render_hwnd and u.GetFocus() != self.render_hwnd:
                 u.SetFocus(self.render_hwnd)
             if tid_fg:
-                u.AttachThreadInput(tid_fg, tid_t, False)
+                u.AttachThreadInput(tid_cur, tid_fg, False)
             time.sleep(0.6)
             if u.GetForegroundWindow() == self.main_hwnd:
                 break
@@ -1023,6 +1448,44 @@ class WeChatGUI:
         """取消置顶，恢复普通 Z 序（配合 ``bring_to_front(keep_topmost=True)`` 使用）。"""
         self._input._user32.SetWindowPos(self.main_hwnd, ctypes.c_void_p(-2),
                                          0, 0, 0, 0, 0x2 | 0x1)   # HWND_NOTOPMOST
+
+    @staticmethod
+    def _release_zorder_after(func):
+        """操作结束后统一收回置顶，中途 return 也不会漏。
+
+        OCR 路径（ENABLE_UIA 关掉后唯一路径）必须先让微信露在最前才能真实
+        点击，而 ``open_chat`` / ``send_msg`` 都是多 return 的长函数，逐个补
+        ``restore_zorder`` 迟早漏一处——漏了就是微信永久压在所有程序上面。
+        """
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            u = self._input._user32
+            prev_fg = u.GetForegroundWindow()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                try:
+                    self.restore_zorder()
+                except Exception as e:
+                    wxlog.debug('操作结束后取消置顶失败：%s', e)
+                # 把前台还给操作前那个窗口。微信收到点击后必自己
+                # SetForegroundWindow（WS_EX_NOACTIVATE 也拦不住），不还回去
+                # 就等于「发一条消息把你的编辑器切走」。
+                # 只在当前前台确实是微信时才还：用户中途自己切走就别抢回来。
+                try:
+                    if prev_fg and prev_fg != self.main_hwnd:
+                        cur = u.GetForegroundWindow()
+                        if cur == self.main_hwnd:
+                            tid = u.GetWindowThreadProcessId(prev_fg, None)
+                            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+                            if tid:
+                                u.AttachThreadInput(cur_tid, tid, True)
+                            u.SetForegroundWindow(prev_fg)
+                            if tid:
+                                u.AttachThreadInput(cur_tid, tid, False)
+                except Exception as e:
+                    wxlog.debug('操作结束后归还前台失败：%s', e)
+        return wrapper
 
     def foreground_is_wechat(self) -> bool:
         """前台窗口是否属于微信主进程。
@@ -1138,13 +1601,20 @@ class WeChatGUI:
             wxlog.info(f'已还原遮挡窗口 {len(done)} 个')
         return len(done)
 
-    def ensure_visible(self, keep_topmost: bool = True) -> bool:
+    def ensure_visible(self, keep_topmost: bool = False,
+                       activate: bool = False) -> bool:
         """把微信置于前台；不再最小化任何其他程序的窗口。
 
         发送类操作前调用。回复只负责让微信可操作：先 ``bring_to_front``
         抢前台并置顶，点击/滚轮落点被别的窗口压住时由
         :meth:`point_belongs_to_wechat` 拦截并跳过本次投递——宁可这一条
         发不出去，也不动用户的桌面。
+
+        默认 ``activate=False``：只确认窗口句柄存活，**不抢前台、不置顶**。
+        发送路径全程走 UIA 写值 + PostMessage 投递，不需要窗口在前台；微信
+        控件收到点击后自己会激活一次（实测拦不住），由调用方把这个激活
+        立刻归还给原前台窗口。只有确实需要真实鼠标键盘的旧路径才显式传
+        ``activate=True``。
 
         批量发送会逐条调用本方法，为避免每条都重复抢前台（上轮实测每次
         开销 20s+），15 秒内已成功前置过且窗口仍存活则直接复用。
@@ -1156,6 +1626,20 @@ class WeChatGUI:
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
                 and self.is_alive()):
             return True
+        if not activate:
+            ok = bool(self.is_alive())
+            if ok:
+                # 之前的 bring_to_front 会把窗口设成 WS_EX_TOPMOST，
+                # 一直压着所有程序；不激活的发送路径要把它取消掉。
+                try:
+                    ctypes.windll.user32.SetWindowPos(
+                        self.main_hwnd, -2, 0, 0, 0, 0,   # HWND_NOTOPMOST
+                        0x0001 | 0x0002 | 0x0010)          # NOSIZE|NOMOVE|NOACTIVATE
+                except Exception:
+                    pass
+            self._last_visible_ok = ok
+            self._last_visible_ts = time.time()
+            return ok
         brought = self.bring_to_front(keep_topmost=keep_topmost)
         time.sleep(0.5)
         self._update_render_rect()
@@ -1188,8 +1672,22 @@ class WeChatGUI:
         随即恢复原样式以保证画面正常合成。
         """
         u = self._input._user32
+        raised_here = False
         if not self.point_belongs_to_wechat(x, y):
-            return
+            # 落点被别的窗口压住。UIA 关掉后这条路全靠真实坐标点击，
+            # 被挡就整条链失效。先把微信提到最前再试一次，只有真被挡时才付
+            # 这次抢前台的代价，点完立刻收回置顶。
+            #
+            # 试过改成窗口消息（PostMessage）避开抢前台：点击能到，但搜索框
+            # 要靠键盘粘贴输入，窗口不激活时按键落到别处、浮层根本不出现，
+            # 比抢前台更不可用，所以这里仍走真实点击。
+            if not self.bring_to_front(keep_topmost=True):
+                return
+            time.sleep(0.35)
+            if not self.point_belongs_to_wechat(x, y):
+                self.restore_zorder()
+                return
+            raised_here = True
         GWL_EXSTYLE = -20
         WS_EX_TRANSPARENT = 0x00000020
         old_ex = u.GetWindowLongW(self.render_hwnd, GWL_EXSTYLE)
@@ -1203,6 +1701,8 @@ class WeChatGUI:
             if old_ex & WS_EX_TRANSPARENT:
                 u.SetWindowLongW(self.render_hwnd, GWL_EXSTYLE, old_ex)
                 time.sleep(0.05)
+            if raised_here:
+                self.restore_zorder()
 
     def wx_wheel(self, delta: int, x: Optional[int] = None, y: Optional[int] = None):
         """滚轮滚动渲染窗口内的内容。
@@ -1237,19 +1737,58 @@ class WeChatGUI:
     # ------------------------------------------------------------------
     # 截图与 OCR
     # ------------------------------------------------------------------
+    def _grab_wgc(self, box: Optional[Tuple[int, int, int, int]] = None) -> Optional[Image.Image]:
+        """用 Windows Graphics Capture 取窗口画面，被遮挡时也能拿到真实内容。
+
+        WGC 读的是 DWM 合成后的窗口表面，与窗口层级、是否被其他窗口压住无关；
+        而 ``ImageGrab`` 走桌面 DC，被遮挡时拍到的是遮挡窗口，``PrintWindow``
+        对 Qt/GPU 渲染的窗口经常返回黑屏。三者按「WGC → 桌面 → PrintWindow」
+        的顺序回退。每次抓一帧就起停一次捕获线程，单帧约 200~400ms。
+
+        起停捕获的细节在模块级 :func:`_capture_window_frame`（搜索浮层那种
+        独立窗口也要用同一套），这里只负责把返回的整窗帧裁成请求的矩形。
+        """
+        img = _capture_window_frame(self.render_hwnd)
+        if img is None:
+            return None
+        if box is None:
+            return img
+        rel_w = box[2] - box[0]
+        rel_h = box[3] - box[1]
+        if rel_w <= 0 or rel_h <= 0:
+            return None
+        # WGC 帧是窗口表面实际像素（2026-11-20 实测 886x643，而 GetWindowRect
+        # 给的 900x650 含边框），两者差 1~2%。原来直接拿渲染窗坐标去裁，宽高
+        # 一越界就返回 None，于是这台机器上 WGC 从未成功、全部回退到桌面截图，
+        # 微信被遮挡时只能拍到遮挡层。这里按帧尺寸映射，再把裁块缩回请求尺寸，
+        # 上层仍然用渲染窗坐标。
+        sx = img.width / max(1, self.render_w)
+        sy = img.height / max(1, self.render_h)
+        rx0 = max(0, min(img.width - 1, round((box[0] - self.origin_x) * sx)))
+        ry0 = max(0, min(img.height - 1, round((box[1] - self.origin_y) * sy)))
+        rx1 = max(rx0 + 1, min(img.width, round((box[2] - self.origin_x) * sx)))
+        ry1 = max(ry0 + 1, min(img.height, round((box[3] - self.origin_y) * sy)))
+        crop = img.crop((rx0, ry0, rx1, ry1))
+        if crop.size != (rel_w, rel_h):
+            crop = crop.resize((rel_w, rel_h), Image.LANCZOS)
+        return crop
+
     def _grab_screen(self, box: Optional[Tuple[int, int, int, int]] = None) -> Image.Image:
         """截取屏幕区域（带重试）。box 为屏幕绝对坐标。
 
-        优先 ``ImageGrab``（走桌面 DC，最快），但它有两种失败方式，都要能接住：
+        顺序：``WGC``（窗口表面，遮挡下正确）→ ``ImageGrab``（桌面 DC）→
+        ``PrintWindow``（窗口自绘）。后两条各有两种失败方式，都要能接住：
 
         * **抛异常**（锁屏、桌面 DC 不可用）——``screen grab failed``；
         * **静默返回全黑**——窗口放在虚拟显示器上时最常见：BitBlt 调用成功，
           但 DWM 没有把这块区域合成进可读的显示表面。这种"成功"必须按失败
           处理，否则 OCR 拿到一片黑只会静默返回空列表，比抛异常更难查。
-
-        两种情况都回退 ``_grab_window``：用 PrintWindow 取窗口自身像素，
-        再按 box 裁出同一块区域。OCR 只关心窗口内容，不需要真的「看得见屏幕」。
         """
+        if box is not None:
+            wgc = self._grab_wgc(box)
+            if wgc is not None and wgc.width > 0 and wgc.height > 0 \
+                    and wgc.convert('L').getextrema()[1] != 0:
+                return wgc
         from PIL import ImageGrab
         last = None
         for _ in range(3):
@@ -1363,15 +1902,18 @@ class WeChatGUI:
         return None
 
     def _uia_mention_item(self, member: str, core: str):
-        """从 UIA 的 MentionPopover 里找目标成员控件。
+        """从 UIA 的 MentionPopover 里找目标成员控件；找不到返回 None。
 
-        微信 4.x 的成员弹层虽然画在主窗上方，UIA 树里是
-        ``AutomationId=MentionPopover`` 下的 ``chat_mention_list``；
-        比 OCR 稳（弹层文字小、半透明，OCR 经常读成侧栏内容）。
-        找不到返回 None，调用方回退 OCR。
+        为什么不能只用 OCR 定位成员：弹层是半透明浮层，WinRT OCR 把
+        「强」读成「弓虽」甚至空，放大/二值化都救不回来（2026-11-19 实测）。
+        所以认人这一步靠 UIA 的 ListItem.Name，点击与读回再各走各的路径。
         """
         try:
             if not getattr(self, 'main_hwnd', 0):
+                return None
+            # 先走 _get_uia()：它会在检测到树退化时重新热激活 accessibility
+            # gate byte。直接 ControlFromHandle 不触发自愈，弹层永远读不到。
+            if self._get_uia() is None:
                 return None
             import uiautomation as auto
             main = auto.ControlFromHandle(self.main_hwnd)
@@ -1493,26 +2035,12 @@ class WeChatGUI:
     def _name_matches(ocr_name: str, target: str) -> bool:
         """OCR 会话名的韧性匹配，容忍首尾字符截断/粘连。
 
-        微信 4.x 标题 OCR 常把首字截掉（'文件传输助手'→'件传输助'），
-        因此不能只用精确相等或 startswith。匹配优先级：
-            1. 完整相等
-            2. 识别名是目标名的一段（截首/截尾/截中）
-            3. 识别名更长时目标名是其子串（识别名带多余字符）
+        判据统一放在模块级的 :func:`_chat_name_score`：完整相等 > OCR 名是
+        目标的一段 > 目标名是较长 OCR 名的一段（多出的必须是纯符号，避免
+        「目标群2」冒充「目标群」）。这里只是把「有分」翻译成布尔值，
+        不再维护第二套规则。
         """
-        a = (ocr_name or '').strip()
-        b = (target or '').strip()
-        if not a or not b:
-            return False
-        if a == b:
-            return True
-        # 截断容忍：OCR 名是目标名的一段（识别名比目标短，属截首/截尾/截中）
-        if a in b:
-            return True
-        # 识别名更长（含多余字符）：仅当识别名 >= 3 字时接受子串命中，
-        # 避免目标名（如 2 字）是较长识别名前缀导致的误点
-        if b in a and len(a) >= 3:
-            return True
-        return False
+        return _chat_name_score(ocr_name, target) > 0
 
     def _past_deadline(self) -> bool:
         """外部调用（群发）可以设 ``open_deadline``（绝对时间戳）限制会话打开耗时。
@@ -1662,11 +2190,27 @@ class WeChatGUI:
                 byte）并重建引擎。
         """
         _UIA_REASSERT_INTERVAL = 30.0   # 秒：退化后的自愈检查节流窗口
+        if not WxParam.ENABLE_UIA:
+            # 总开关关掉时立刻返回，连热激活都不做：用户要的是完全不碰
+            # 微信控件树（见 param.ENABLE_UIA 的代价说明）。
+            self._uia = None
+            return None
+        if not hasattr(self, '_uia'):
+            # 用 object.__new__ 构造的测试替身没有 __init__ 里的这几个缓存字段
+            self._uia = None
+            self._uia_tried = False
+            self._uia_check_ts = 0.0
+        main_hwnd = getattr(self, 'main_hwnd', 0)
+        if not main_hwnd:
+            # object.__new__ 造出来的测试替身没有 __init__ 的字段。这里曾经
+            # 直接读 self.main_hwnd 抛 AttributeError，被外层 except 吞成
+            # 「初始化 UIA 引擎失败」，在真实日志里刷了一整天噪音。
+            return None
         if self._uia is not None:
             try:
                 root = self._uia._win
-                bound = (getattr(self._uia, 'hwnd', None) == self.main_hwnd
-                         and (root is None or int(root.NativeWindowHandle) == self.main_hwnd))
+                bound = (getattr(self._uia, 'hwnd', None) == main_hwnd
+                         and (root is None or int(root.NativeWindowHandle) == main_hwnd))
             except Exception:
                 bound = False
             if not bound:
@@ -1696,8 +2240,8 @@ class WeChatGUI:
             self._uia_tried = True
             try:
                 from wechatauto.uia_driver import WeChatUIA
-                eng = WeChatUIA(hwnd=self.main_hwnd)
-                if eng.ensure_window():
+                eng = WeChatUIA(hwnd=main_hwnd)
+                if eng.ensure_window(activate=False):
                     self._uia = eng
                     self._window_kind(eng)
                     wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
@@ -1719,89 +2263,103 @@ class WeChatGUI:
         known = getattr(self, '_uia_window_kind', None)
         return known[1] if known and known[0] == hwnd else 'unknown'
 
+    @_release_zorder_after
     def open_chat(self, name: str, exact: bool = False) -> bool:
-        """打开指定会话的聊天窗口（优先 UIA，其次 OCR 侧栏/搜索）。
+        """先核对当前会话，再扫一次可见列表，未命中时用 OCR 搜索候选。
 
-        微信 4.x 行为：点侧栏会话在主窗右侧面板打开；搜索下拉点联系人则
-        打开独立聊天窗口（标题“昵称与X的聊天记录”）。本方法两条路都处理，
-        打开后把 GUI 操作目标切到对应窗口，并验证会话真正打开。
+        入参可以是显示名，也可以是 ``chat_id``（``chenjiaqiang97``、
+        ``wxid_*``、``xxx@chatroom``）：机器人手里拿到的一直是后者，而
+        微信搜索框只认显示名/微信号，直接把 chat_id 敲进去搜不到任何人
+        （2026-11-20 连续 4 次发送失败就是这个）。进门前先换回备注/昵称。
         """
+        resolved = _display_name_for(name)
+        if resolved and resolved != name:
+            wxlog.debug('open_chat: %r 是 username，改用显示名 %r', name, resolved)
+            name = resolved
         uia = self._get_uia()
         kind = self._window_kind(uia)
         if uia is not None:
-            # 把外部设的时限传进 UIA 搜索：它内部按候选词/重试轮转，每轮
-            # 检查一次——否则打不开的目标会在搜索阶段先耗掉二十几秒。
             if uia.open_chat(name, deadline=getattr(self, 'open_deadline', 0)):
                 self._current_chat = name
                 return True
         if kind in ('chat', 'history'):
             return False
-        if not self.ensure_visible():
+        if not WxParam.ALLOW_OCR_CHAT_FALLBACK:
+            wxlog.warning(
+                'UIA 打不开会话 %r，且已禁用 OCR 回退（那条路会移动用户鼠标、'
+                '把微信顶到前台）；如需旧行为把 WxParam.ALLOW_OCR_CHAT_FALLBACK '
+                '设为 True', name)
+            return False
+        # 保持现有坐标输入契约：真实点击前仍需激活窗口，退出时由装饰器恢复层级。
+        if not self.ensure_visible(keep_topmost=True, activate=True):
             wxlog.warning('无法将微信窗口置于前台，尝试继续操作')
-        # 优先：右侧面板当前已打开目标会话 → 直接成功
-        # （微信 4.x 已打开的会话才渲染右侧，侧栏查找反而慢且易误配）
         self._update_render_rect()
         if self._chat_is_open(name) and self._pane_has_content():
+            self._current_chat = name
             return True
-        # 优先侧栏：多轮「查找 + 点击 + 确认」（侧栏点击最可靠）
-        for _ in range(3):
-            if self._past_deadline():
-                wxlog.warning('打开 %r 已超过时限，放弃', name)
-                return False
-            pos = self.find_session(name)
-            if pos:
-                self.use_window(self.main_hwnd)
-                rx, ry = pos
-                # 行已是当前高亮（会话已打开）：再点一次会关闭它，直接确认
-                if self._row_is_active(ry):
-                    if self._pane_has_content():
-                        return True
-                    # 高亮但面板空白：不点击（点击会关闭会话），交给搜索兜底
-                    wxlog.debug(f'会话 {name} 行已高亮但面板空白，跳过点击')
-                else:
-                    self.wx_click(self.origin_x + rx, self.origin_y + ry)
-                    if self._chat_open_confirmed(name):
-                        return True
-            wxlog.debug(f'侧栏未确认打开 {name}，重试')
+
+        # 原尺寸 OCR 只扫当前列表一次；名字并列或只命中短前缀时不点。
+        # 这台机器 900px 宽的窗口里原尺寸 OCR 会把会话名读残缺（实测「龙虾吹水」
+        # →「花虾吹水」），所以未命中时补一次放大扫描，而不是像原来那样多轮投票。
+        row = _best_session_row(self.get_sessions(), name)
+        if row is None and not self._past_deadline():
+            row = _best_session_row(self.get_sessions(zoomed=True), name)
+        if row:
+            self.use_window(self.main_hwnd)
+            rx, ry = rhythm.point((row['x'], row['y'],
+                                   row['x'] + row['w'], row['y'] + row['h']))
+            if self._row_is_active(ry):
+                if self._chat_open_confirmed(name):
+                    self._current_chat = name
+                    return True
+            else:
+                self.wx_click(self.origin_x + rx, self.origin_y + ry)
+                if self._chat_open_confirmed(name):
+                    self._current_chat = name
+                    return True
+
+        if self._past_deadline():
+            wxlog.warning('打开 %r 已超过时限，放弃', name)
+            return False
+        # Jev 式搜索是可见列表未命中后的主路径；候选不唯一时不点击。
+        if not self._search_chat(name):
+            wxlog.debug('搜索未找到唯一会话候选：%r', name)
+            return False
+
+        main_hwnd = self.main_hwnd
+        sub = self._find_chat_window(name)
+        if sub:
+            _restore_keep_maximize(self._input._user32, sub)
+            self._input._user32.SetForegroundWindow(sub)
             time.sleep(0.5)
-        # 侧栏找不到 → 搜索框回退（搜索下拉易误开独立历史窗，仅作最后手段）
-        if self._search_chat(name):
-            sub = self._find_chat_window(name)
-            if sub:
-                _restore_keep_maximize(self._input._user32, sub)
-                self._input._user32.SetForegroundWindow(sub)
-                time.sleep(0.5)
-                self.use_window(sub)
-                time.sleep(0.3)
-                return True
+            if not self.use_window(sub):
+                self.use_window(main_hwnd)
+                return False
+            time.sleep(0.3)
             if self._chat_open_confirmed(name):
+                self._current_chat = name
                 return True
+            self.use_window(main_hwnd)
+            return False
+        if self._chat_open_confirmed(name):
+            self._current_chat = name
+            return True
+        wxlog.warning('搜索候选已点击，但标题未核对为目标会话 %r', name)
         return False
 
     def _chat_open_confirmed(self, name: str) -> bool:
-        """点击会话后轮询确认已打开。
+        """只用当前标题确认目标；消息面板非空不能证明会话名正确。
 
-        微信 4.x 聊天标题为浅灰渲染、OCR 常读不到，因此标题命中算最可靠
-        证据，读不到时以「消息区已渲染非空白」作为会话已打开的判据。
-        注意：若此前已开着其它会话，面板非空白并不代表目标已打开，
-        必须优先看标题命中。
+        标题是浅灰小字，放大 OCR 也要几百毫秒才稳定，所以给约 2.5 秒窗口；
+        一命中就返回，不在稳定的页面上多等。
         """
-        for _ in range(5):
+        for attempt in range(6):
             if self._past_deadline():
                 return False
-            time.sleep(0.6)
             if self._chat_is_open(name):
                 return True
-        # 标题始终读不到才退而求其次：面板有内容且非目标会话也算打开
-        # （点错会话时标题会匹配到别的名字，标题优先可拦截误开）
-        for _ in range(3):
-            if self._past_deadline():
-                return False
-            time.sleep(0.4)
-            if self._chat_is_open(name):
-                return True
-            if self._pane_has_content():
-                return True
+            if attempt < 5:
+                time.sleep(0.5)
         return False
 
     def _pane_has_content(self) -> bool:
@@ -1821,14 +2379,7 @@ class WeChatGUI:
             return False
 
     def _chat_is_open(self, name: str) -> bool:
-        """检测右侧面板是否打开了指定会话（UIA 优先，OCR 兜底）。
-
-        UIA 那条读的是输入框控件的 Name（== 当前聊天对象），不依赖渲染，
-        OCR 关掉后仍然有效；OCR 常把标题首字符截掉（“文件传输助手”→“件传
-        输助”），所以留作兜底且用名称中段片段匹配。标题字号小、含生僻字时
-        原尺寸 OCR 会漏识别，需放大后再读；标题行实际渲染在 y≈80-180
-        （非顶部 15-100），OCR 区需向上/向下多留。
-        """
+        """用窗口内标题核验会话；OCR 首尾截断时只接受足够长的连续片段。"""
         uia = self._get_uia()
         if uia is not None:
             try:
@@ -1836,107 +2387,123 @@ class WeChatGUI:
             except Exception as exc:
                 wxlog.debug(f'UIA 读当前会话失败：{exc!r}')
                 cur = None
-            if cur:
-                return cur == name or (len(name) >= 2 and name in cur) or (
-                    len(cur) >= 2 and cur in name)
+            if cur and _chat_name_score(cur, name):
+                return True
         if not ScreenOCR.available():
             return False
         try:
             # 标题文本贴右面板左边缘（可能略越过侧栏边界），OCR 区向左多留
             x0 = max(0, self.right_pane_left - 60)
             res = self.ocr_zoomed((x0, 0, self.render_w, 185), scale=3)
-            title = ''.join(t.strip() for t, x, y, w, h in res)
-            if len(name) >= 3:
-                frags = (name[1:3], name[2:4], name[-2:], name[:2])
-            else:
-                frags = (name,)
-            return any(f and f in title for f in frags)
+            for text, _x, _y, _w, _h in res:
+                if _chat_name_score(text, name):
+                    return True
+                if _title_similar(_chat_name_key(text), _chat_name_key(name)):
+                    return True
+            return False
         except Exception as exc:
             wxlog.debug(f'标题片段匹配失败：{exc!r}')
             return False
 
     def _typed_into_chat_input(self, expect: str) -> bool:
-        """自检：兜底粘贴有没有落进聊天输入框（点击没抢到焦点时就会这样）。
+        """自检：搜索/粘贴的字有没有落进聊天输入框（点击没抢到焦点时就会这样）。
 
-        落进去等于在别人会话的发送区里挂了一颗雷——下一次回车就发出去了。
-        发现就立刻用 UIA ValuePattern 清空（不发按键）并让调用方放弃。
+        落进去等于在别人会话的发送区挂了一颗雷——下一次回车就发出去了。
+        发现就清空并让调用方放弃。UIA 关掉后 ValuePattern 不可用（``_get_uia``
+        返回 None），原来那条路等于完全失效，所以改读 OCR；读不准时偏「没落
+        进去」，代价只是搜索兜底少一次成功率，不会把字发出去——发送前还有
+        独立的读回校验。
         """
-        uia = self._get_uia()
-        if uia is None:
+        expect = (expect or '').strip()
+        if not expect:
+            return False
+        text = (self.read_input_text() or '').replace(' ', '')
+        if expect.replace(' ', '') not in text:
             return False
         try:
-            e = uia._chat_input()
-            vp = e.GetValuePattern() if e is not None else None
-            if vp is None or (vp.Value or '').strip() != (expect or '').strip():
-                return False
-            vp.SetValue('')
-            wxlog.warning(f'搜索词 {expect!r} 被粘进了聊天输入框，已清空并放弃搜索兜底')
-            return True
+            box = self.get_input_box()
+            if box:
+                cx, cy = rhythm.point(box)
+                self.wx_click(cx, cy)
+                time.sleep(0.15)
+                self._input.key(VK_A, ctrl=True)
+                self._input.key(VK_DELETE)
         except Exception as ex:
-            wxlog.debug(f'聊天输入框自检失败：{type(ex).__name__}: {ex}')
-            return False
+            wxlog.debug(f'清空误落的搜索词失败：{type(ex).__name__}: {ex}')
+        wxlog.warning(f'搜索词 {expect!r} 落进了聊天输入框，已尝试清空并放弃搜索')
+        return True
 
     def _search_chat(self, name: str) -> bool:
-        """退路：搜索框 + 剪贴板粘贴搜索，点选名称匹配的第一条联系人。
+        """搜索并点击浮层里的唯一候选。
 
-        搜索下拉结果排布：联系人在最上方，下面是「搜索网络结果 / 搜一搜」
-        等节标题。OCR 结果按 y 排序后，跳过节标题/提示行，点选视觉上
-        第一条匹配名称的联系人行。
-
-        群聊的成员预览行（如「00，包含：某好友」）也含目标名片段，若不
-        排除会误点群聊而非联系人。群聊节标题「群聊」以下的行优先排除，
-        含「包含」的成员预览行直接跳过。
+        实测微信 4.x 的搜索结果不在主窗画布内，而在同进程的独立顶层窗口
+        ``Qt51514QWindowToolSaveBits`` 里——抓主窗永远看不到候选，这也解释了
+        之前「搜索未找到唯一会话候选」却贴进了搜索词的现象。这里点完搜索框后
+        直接抓那个浮层窗口做 OCR，再按浮层自己的矩形换算屏幕坐标点击。
         """
-        frag = name[:2]
-        uia = self._get_uia()
-        anchor = uia.search_box_rect() if uia is not None else None
-        for _ in range(3):
-            if anchor:
-                # 树里有精确矩形，别拿比例猜（猜偏就会粘进别的控件）
-                cx, cy = rhythm.point(anchor)
-            else:
-                sb = self._rel_to_screen(self.search_box)
-                cx, cy = rhythm.point(sb)
-            self.wx_click(cx, cy)
-            time.sleep(0.3)
-            self._input.key(VK_A, ctrl=True)
-            self._input.key(VK_DELETE)
-            if self.set_clipboard(name) is False:
-                return False
-            self._input.key(VK_V, ctrl=True)
-            time.sleep(0.8)
-            if self._typed_into_chat_input(name):
-                return False
-            res = self.ocr_zoomed((SIDEBAR_LEFT, int(self.render_h * 0.08),
-                                   self.sidebar_right, self.render_h), scale=2)
-            rows = sorted(res, key=lambda r: (r[2], r[1]))
-            group_section = False
-            for t, x, y, w, h in rows:
-                tt = (t.strip() or '')
-                if not tt:
-                    continue
-                if tt == '群聊':
-                    group_section = True
-                    continue
-                if tt.startswith('聊天记录') or tt.startswith('查看全部'):
-                    break
-                if group_section:
-                    continue
-                # 跳过“搜索/网络/搜一搜”等节标题与提示行
-                if (tt.startswith('搜索') or tt.startswith('搜一搜')
-                        or '网络' in tt or '暂无' in tt):
-                    continue
-                # 群聊成员预览行，跳过以免误点群聊
-                if '包含' in tt or tt.endswith('群') or tt.endswith('群聊'):
-                    continue
-                if frag in tt:
-                    px, py = rhythm.point((self.origin_x + x, self.origin_y + y,
-                                           self.origin_x + x + w,
-                                           self.origin_y + y + h))
-                    self.wx_click(px, py)
-                    time.sleep(0.8)
-                    return True
-        return False
+        if self._past_deadline():
+            return False
+        # 优先用微信号搜：单字昵称（「强」）通讯录里常重名，浮层里出来两个人
+        # 只能靠 OCR 认名字，而小字恰好认错。微信号唯一且是 ASCII，浮层里
+        # 只剩目标一个人；数据库里查不到唯一微信号时退回按名字搜。
+        alias = _alias_for_name(name)
+        query = alias or name
+        # 搜索框要靠真实键盘输入，必须让微信回到前台并拿到焦点。OCR 回退本来
+        # 就是这个契约；只调 bring_to_front 不够——实测紧接着的点击/按键常
+        # 落在还没接管焦点的窗口上，浮层根本不出现。
+        self.ensure_visible(keep_topmost=True, activate=True)
+        time.sleep(0.4)
+        anchor = rhythm.point(self._rel_to_screen(self.search_box))
+        cx, cy = anchor
+        self.wx_click(cx, cy)
+        time.sleep(0.5)
+        self._input.key(VK_A, ctrl=True)
+        self._input.key(VK_DELETE)
+        # 逐字键入比剪贴板粘贴可靠：粘贴要求窗口在按键那一刻仍持有焦点，
+        # 两个进程争前台时经常落到别处，搜索框空着、浮层根本不出现
+        # （实测连续两次都是这个现象）。逐字键入在同样条件下一次就出浮层。
+        self._input.type_unicode(query)
+        # 搜索框没抢到焦点时，这些字会落进聊天输入框——那就是在别人会话的
+        # 发送区里挂了一颗雷，下一次回车就发出去。发现就放弃，不改用手工
+        # 清空后的不确定状态继续往下走。
+        if self._typed_into_chat_input(query):
+            wxlog.debug('搜索词落进了聊天输入框，放弃本次搜索')
+            return False
+
+        popup = None
+        for _ in range(8):
+            time.sleep(0.25)
+            popup = _find_search_popup(self.main_hwnd)
+            if popup or self._past_deadline():
+                break
+        if not popup:
+            wxlog.debug('搜索浮层没有出现：%r', name)
+            return False
+
+        hwnd, rect = popup
+        frame = _capture_window_frame(hwnd)
+        if frame is None:
+            wxlog.debug('搜索浮层抓帧失败：%r', name)
+            return False
+        # 浮层只有 300~400px 宽，字更小；放大两倍再识别，坐标换算回原尺寸。
+        rows = ScreenOCR.recognize(
+            frame.resize((frame.width * 2, frame.height * 2), Image.LANCZOS))
+        rows = [(text, x // 2, y // 2, max(1, w // 2), max(1, h // 2))
+                for text, x, y, w, h in rows]
+        hit = (_popup_alias_row(rows, alias, frame.height) if alias
+               else _popup_result_row(rows, name, frame.height))
+        if hit is None:
+            wxlog.debug('搜索浮层没有唯一候选：%r（query=%r alias=%r，%d 行）',
+                        name, query, alias, len(rows))
+            self._input.key(VK_ESCAPE)
+            return False
+        label, rx, ry, rw, rh = hit
+        px, py = rhythm.point((rect[0] + rx, rect[1] + ry,
+                               rect[0] + rx + rw, rect[1] + ry + rh))
+        wxlog.debug('搜索候选唯一匹配 %r → %r（query=%r）', name, label, query)
+        self.wx_click(px, py)
+        time.sleep(0.8)
+        return True
 
     # ------------------------------------------------------------------
     # 输入框
@@ -1965,91 +2532,79 @@ class WeChatGUI:
             wxlog.debug('读取聊天输入控件位置失败：%s', exc)
         return None
 
-    def get_input_box(self) -> Optional[Tuple[int, int, int, int]]:
-        """自适应输入框检测，返回渲染相对矩形 (x0,y0,x1,y1)。
+    def _input_box_cache_key(self) -> tuple:
+        """把矩形绑定到实际渲染窗和布局，避免坐标跨窗口或缩放复用。
 
-        优先读取当前窗口的真实 UIA 聊天编辑框；不可用时再做像素探测。
-        输入框是右侧面板底部一块**全宽浅色区**，与上方消息区以一条
-        约 2px 的浅灰边框线 ((224,224,224)) 分隔。先取若干探针行（自下而上
-        在输入框下半部找一行，要求该行在 right_pane_left..render_w 范围内
-        白度 >=0.8），再从探针行向上/向下扫描中心竖线确定输入框上下边界。
-        探测失败返回 None（不再回退到默认布局，避免在错误坐标上误点）。
+        用 getattr 读窗口字段：``object.__new__`` 造出来的替身没有 __init__
+        里的字段，这里抛 AttributeError 会一路冒到发送流程（已被测试抓到）。
         """
+        return (getattr(self, 'render_hwnd', None),
+                getattr(self, 'render_w', None),
+                getattr(self, 'render_h', None),
+                getattr(self, 'layout_profile', None),
+                getattr(self, 'right_pane_left', None))
+
+    def _remember_input_box(self, box: Optional[Tuple[int, int, int, int]]) -> None:
+        """只记录本窗口刚确认过的矩形；窗口尺寸变化由 key 不匹配自动失效。"""
+        self._last_input_box = box
+        self._last_input_box_key = self._input_box_cache_key() if box else None
+
+    def get_input_box(self) -> Optional[Tuple[int, int, int, int]]:
+        """返回渲染窗相对输入框矩形；像素识别每帧只扫描内存中的同一张图。"""
         self._update_render_rect()
         uia = self._get_uia()
         if self._window_kind(uia) in ('chat', 'history'):
             # 独立记录窗没有发送框；独立聊天窗也不能借用主窗比例猜坐标。
             return self._uia_input_box()
-        for _ in range(6):
-            box = self._uia_input_box() or self._probe_input_box()
-            if box:
-                return box
-            time.sleep(0.5)
-            self._update_render_rect()
-        wxlog.debug('未检测到输入框')
-        # 布局异常自动重校准：本机校准配置可能已不匹配（DPI/布局漂移），
-        # 重新检测锚点并校准一次后再次探测（每会话只自动触发一次）。
-        if not getattr(self, '_auto_recalibrated', False):
-            self._auto_recalibrated = True
-            wxlog.info('输入框探测连续失败，自动重新校准布局…')
-            self.calibrate_layout()
-            for _ in range(3):
-                box = self._uia_input_box() or self._probe_input_box()
+
+        for attempt in range(2):
+            key = self._input_box_cache_key()
+            frame = None
+            try:
+                frame = self._grab_screen(self._rel_to_screen(
+                    (0, 0, self.render_w, self.render_h)))
+            except Exception as exc:
+                wxlog.debug('输入框定位截图失败：%s', exc)
+            if frame is not None and frame.size == (self.render_w, self.render_h):
+                cached = getattr(self, '_last_input_box', None)
+                if (cached and getattr(self, '_last_input_box_key', None) == key
+                        and _cached_input_box_matches_frame(
+                            frame, cached, self.right_pane_left)):
+                    return cached
+                box = self._probe_input_box(frame)
                 if box:
+                    self._remember_input_box(box)
                     return box
-                time.sleep(0.5)
+            else:
+                self._remember_input_box(None)
+            if attempt == 0:
+                time.sleep(0.15)
                 self._update_render_rect()
+
+        # 浅色会话可能没有可见分隔线；发送前仍由输入框内容读回校验兜底坐标。
+        box = (self.right_pane_left,
+               int(self.render_h * INPUT_BOX_RATIO[1]),
+               int(self.render_w * INPUT_BOX_RATIO[2]),
+               int(self.render_h * INPUT_BOX_RATIO[3]))
+        x0, y0, x1, y1 = box
+        if x0 < x1 <= self.render_w and y0 < y1 <= self.render_h:
+            wxlog.debug('输入框改用比例兜底：%s', box)
+            self._remember_input_box(box)
+            return box
+        self._remember_input_box(None)
         wxlog.debug('未检测到输入框')
         return None
 
-    def _probe_input_box(self) -> Optional[Tuple[int, int, int, int]]:
-        """探针法定位输入框，失败返回 None。
-
-        输入框是右侧面板底部一块全宽浅色区，顶边是一条约 2px 的浅灰
-        （224,224,224）分界线，与上方消息区（白底）分隔。消息区在渲染
-        未稳定时可能整体发白，需校验分界线是「细线」而非消息区里的
-        粗灰元素，否则会把消息区误判为输入框。
-        """
-        cx = (self.right_pane_left + self.render_w) // 2
-        sx = self.origin_x + cx
-        for probe_off in (150, 120, 200, 250, 350, 100, 450):
-            probe_y = self.render_h - probe_off
-            if probe_y <= int(self.render_h * 0.50):
-                continue
-            sy = self.origin_y + probe_y
-            row_img = self._grab_screen(
-                (self.origin_x + self.right_pane_left, sy,
-                 self.origin_x + self.render_w, sy + 1))
-            pxx = row_img.load()
-            w = row_img.size[0]
-            white = sum(1 for x in range(0, w, 2) if sum(pxx[x, 0]) / 3 > 240)
-            if white / max(1, (w + 1) // 2) < 0.8:
-                continue  # 该行不在输入框内（如工具条/空白）
-            scan_top = self.origin_y + int(self.render_h * 0.50)
-            col = self._grab_screen((sx, scan_top, sx + 1, sy + 1))
-            pc = col.load()
-            dy_probe = sy - scan_top
-            y0 = dy_probe
-            while y0 > 0 and sum(pc[0, y0]) / 3 > 240:
-                y0 -= 1
-            y0 += 1
-            y1 = dy_probe
-            while y1 < col.size[1] - 1 and sum(pc[0, y1]) / 3 > 240:
-                y1 += 1
-            # 输入框顶边上方必须是 1-4px 的细灰分界线；若是消息区里的
-            # 粗灰元素（如系统消息/时间分隔），说明渲染未稳定，判为失败。
-            g = y0 - 1
-            while g >= 0 and sum(pc[0, g]) / 3 <= 240:
-                g -= 1
-            divider_h = (y0 - 1) - g
-            y0_abs = scan_top + y0 - self.origin_y
-            y1_abs = scan_top + y1 - self.origin_y
-            if (1 <= divider_h <= 4
-                    and y1_abs - y0_abs >= 150
-                    and y0_abs >= int(self.render_h * 0.45)
-                    and y1_abs >= int(self.render_h * 0.85)):
-                return (self.right_pane_left, y0_abs, self.render_w, y1_abs)
-        return None
+    def _probe_input_box(
+            self, frame: Optional[Image.Image] = None,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """在给定的渲染帧内找分隔线；省略 frame 时也只抓一张完整帧。"""
+        if frame is None:
+            frame = self._grab_screen(self._rel_to_screen(
+                (0, 0, self.render_w, self.render_h)))
+        if frame is None or frame.size != (self.render_w, self.render_h):
+            return None
+        return _detect_input_box_from_frame(frame, self.right_pane_left)
 
     def focus_input(self, box: Optional[Tuple[int, int, int, int]] = None) -> bool:
         """点击输入框文本区使其获得焦点。返回是否检测到输入框。
@@ -2088,6 +2643,46 @@ class WeChatGUI:
         time.sleep(0.2)
         return True
 
+    def _input_via_uia(self, text: str,
+                       box: Optional[Tuple[int, int, int, int]] = None) -> bool:
+        """用 UIA 写值代替逐字键入：一次写入整段文本，支持换行与 emoji。
+
+        先投递一次点击让输入框获得焦点（群聊里没有聚焦时发送按钮不响应），
+        再用 ValuePattern.SetValue 写入并读回比对。失败返回 False，
+        由调用方回退到逐字键入（``rhythm.type_text``）。
+        """
+        try:
+            uia = self._get_uia()
+        except Exception:
+            return False
+        if uia is None:
+            return False
+        if getattr(uia, '_win', None) is None:
+            try:
+                if not uia.ensure_window():
+                    return False
+            except Exception:
+                return False
+        edit = uia._chat_input()
+        if edit is None:
+            return False
+        if not uia._post_click_ctrl(edit):
+            return False
+        time.sleep(0.3)
+        try:
+            edit.GetValuePattern().SetValue(text)
+        except Exception as exc:
+            wxlog.debug('SetValue 写入失败：%s', exc)
+            return False
+        time.sleep(0.2)
+        got = uia._read_edit_value(edit)
+        if (got or '') != text:
+            wxlog.warning('SetValue 读回不一致：期望 %r 读回 %r',
+                          (text or '')[:40], (got or '')[:40])
+            return False
+        self._remember_input_box(box or self.get_input_box())
+        return True
+
     def input_text(self, text: str,
                    box: Optional[Tuple[int, int, int, int]] = None,
                    fast: bool = False) -> bool:
@@ -2102,6 +2697,9 @@ class WeChatGUI:
         """
         # 记下待发文本，交给随后的 click_send 在回车前回读比对
         self._pending_text = text
+        if WxParam.SEND_VIA_POSTMESSAGE and self._input_via_uia(text, box):
+            wxlog.debug('输入文字（UIA 写值）成功，%d 字', len(text))
+            return True
         if fast and box:
             if self.focus_input(box):
                 if not self.foreground_is_wechat():
@@ -2112,7 +2710,7 @@ class WeChatGUI:
                 rhythm.type_text(text)
                 time.sleep(0.35)
                 if self._input_box_has_text(box):
-                    self._last_input_box = box
+                    self._remember_input_box(box)
                     return True
             return False
         for attempt in range(1, 3):     # 最多打两遍：失败重打一次，不无限拖着发送锁
@@ -2132,7 +2730,7 @@ class WeChatGUI:
             rhythm.type_text(text)
             time.sleep(0.4)
             if self._input_box_has_text(box) and self._pending_text_ok(text):
-                self._last_input_box = box
+                self._remember_input_box(box)
                 wxlog.debug(f'输入文字（逐字键入）成功，attempt={attempt}')
                 return True
             wxlog.warning(f'逐字输入未确认（attempt={attempt}），清空重打')
@@ -2175,8 +2773,11 @@ class WeChatGUI:
         if not box:
             return False
         x0, y0, x1, y1 = box
-        # UIA 返回的是编辑控件本身；不能越过它把工具栏图标算成残留文字。
-        rel = (x0 + 20, y0 + 10, x1 - 20, min(y1, y0 + 200))
+        # 只取首行高度：输入框下方就是表情/文件/剪切/语音那一排工具栏图标，
+        # 把它们算进来会让「发送后是否已清空」永远判成还有文字。2026-11-20
+        # 实测：WGC 修好后这个误判才暴露出来（此前 WGC 一直失败、走桌面截图
+        # 时同样包含工具栏，只是那条路径被别的问题掩盖了）。
+        rel = (x0 + 20, y0 + 10, x1 - 20, min(y1, y0 + 64))
         if rel[0] >= rel[2] or rel[1] >= rel[3]:
             return False
         img = self._grab_screen(self._rel_to_screen(rel))
@@ -2234,6 +2835,22 @@ class WeChatGUI:
             return False
         rhythm.gate('send')
         self._send_attempted = True
+        # 优先用「PostMessage 点发送按钮」：不离开焦点、不按回车。
+        # 失败（找不到按钮/投递被拒）才回退到原来的回车提交。
+        if WxParam.SEND_VIA_POSTMESSAGE:
+            try:
+                uia = self._get_uia()
+            except Exception:
+                uia = None
+            if uia is not None and getattr(uia, '_win', None) is not None:
+                btn = uia._send_button()
+                if btn is not None and uia._post_click_ctrl(btn):
+                    for attempt in range(1 if fast else 3):
+                        rhythm.nap(0.5 if fast or attempt else 1.0)
+                        if not self._input_box_has_text(box):
+                            return True
+                    return False
+                wxlog.warning('发送按钮不可用或投递失败，回退回车提交')
         self._input.key(VK_RETURN)
         # 清空可能延迟；只轮询，不因像素误判再次按回车或点发送。
         for attempt in range(1 if fast else 3):
@@ -2242,6 +2859,7 @@ class WeChatGUI:
                 return True
         return False
 
+    @_release_zorder_after
     def send_msg(self, text: str, who: Optional[str] = None,
                  verify: bool = False) -> WxResponse:
         """发送一条文本消息。
@@ -2268,8 +2886,14 @@ class WeChatGUI:
                 return WxResponse.failure('目标与绑定的独立聊天窗口不一致')
         # 快速路径：连续发送同一会话（如分段回复）时，复用已探测的输入框，
         # 发送前失败才回退完整流程；投递回车后无法确认时禁止重新发送。
+        # _current_chat 只是缓存——用户随时可能在微信里手动切到别的会话，
+        # 缓存不会知道。不核实界面就往缓存坐标打字，消息会落进他当前选中
+        # 的会话（2026-11-20 实测：遮挡下搜索失败，回复发进了当前选中的
+        # 对话）。_chat_is_open 走 WGC 读真实标题，遮挡下也读得准；返回
+        # False 就走完整流程重新打开目标，宁可慢几秒也不盲发。
         if (kind != 'chat' and not verify and who
                 and who == getattr(self, '_current_chat', None)
+                and self._chat_is_open(who)
                 and getattr(self, '_last_input_box', None) is not None
                 and self.input_text(text, box=self._last_input_box, fast=True)):
             if self.click_send(fast=True):
@@ -2316,7 +2940,7 @@ class WeChatGUI:
                                       data={'content': text})
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
-        self._last_input_box = None
+        self._remember_input_box(None)
         deadline = time.time() + 75
         # 记录最后一次卡在哪一步：以前三种失败都收敛成同一句「多次重试未完成」，
         # 使用者只能看到「输入框检测失败」，猜不到界面其实停在朋友圈/通讯录。
@@ -2877,23 +3501,47 @@ class WeChatGUI:
     # 艾特成员（群聊）
     # ------------------------------------------------------------------
     def read_input_text(self) -> str:
-        """读输入框当前内容；UIA 不可用/读不到返回空串。
+        """读输入框当前内容（截图 + OCR）；读不到返回空串。
 
-        真 @ 的对象校验必须靠界面读回，不能只信成员弹层点了第一行。
+        不走 UIA：``chat_input_field`` 的 ``Value`` 返回的是**当前会话名**
+        而不是输入框内容（2026-11-19 实测，读回的是「虾吹水群」），拿它
+        做校验等于把会话名当草稿。输入框字号很小，原尺寸 OCR 一项都读不出，
+        必须放大：实测单字 ``@强`` 在 2 倍时只有 3/5 命中、3 倍 5/5 命中，
+        三个字以上 2 倍就够——取 3 倍兼顾短内容。
         """
-        uia = self._get_uia()
-        if uia is None:
-            return ''
+        # 先试 UIA 的 ValuePattern：真 @ token 是渲染成胶囊的对象替换符
+        # （\ufffc），截图 OCR 只能读到空白，只有 ValuePattern 能拿到它。
+        # 注意 chat_input_field 的 Value 在「输入框为空」时会返回当前会话名，
+        # 那是已知异常值，不能当草稿，落到下面的 OCR 分支再判断。
         try:
-            ctrl = uia._chat_input()
-            if ctrl is None:
+            uia = self._get_uia()
+            if uia is not None:
+                ctrl = uia._chat_input()
+                if ctrl is not None:
+                    reader = getattr(uia, '_read_edit_value', None)
+                    val = reader(ctrl) if callable(reader) else None
+                    if val is not None and val != (ctrl.Name or ''):
+                        return str(val or '')
+        except Exception as e:
+            wxlog.debug(f'UIA 读取输入框失败，改走 OCR：{e!r}')
+        try:
+            box = self.get_input_box()
+            if not box:
                 return ''
-            reader = getattr(uia, '_read_edit_value', None)
-            val = reader(ctrl) if callable(reader) else None
-            if val is not None:
-                return str(val or '')
-            vp = ctrl.GetValuePattern()
-            return (vp.Value or '') if vp is not None else ''
+            x1, y1, x2, y2 = box
+            screen_box = (self.origin_x + x1, self.origin_y + y1,
+                          self.origin_x + x2, self.origin_y + y2)
+            # 这里用 ImageGrab 而不是 _grab_screen：调用前已把微信抢到前台，
+            # 不存在被遮挡的问题；而 WGC 拿的是窗口表面帧，输入框刚写进去的
+            # 短内容经常还没合成进去（实测 ``@强`` 两次都读不出、同样内容
+            # ImageGrab 5/5 命中）。2026-11-20 又试了一次 WGC：遮挡下读到的
+            # 是空白或旧帧，不如桌面截图准。
+            from PIL import ImageGrab
+            img = ImageGrab.grab(bbox=screen_box, all_screens=True)
+            if img is None or img.width <= 0 or img.height <= 0:
+                return ''
+            img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
+            return ''.join(t for t, *_ in ScreenOCR.recognize(img))
         except Exception as e:
             wxlog.debug(f'读取输入框内容失败：{e!r}')
             return ''
@@ -2903,34 +3551,136 @@ class WeChatGUI:
         """输入框回读归一化：只去掉空白，保留 @ 和名字的原始字符。"""
         return ''.join((text or '').split())
 
+    def _ocr_text_match(self, expected: str, got: str,
+                        threshold: float = 0.8) -> bool:
+        """OCR 读回比对：长文本会因形近字出错，用相似度而不是精确子串。
+
+        只在长度相近的滑窗上取最高相似度，避免 OCR 把两行拼起来时
+        整段比对失真。阈值 0.8 对应实测「@强关键词广告自检文本」被读成
+        「@强关键词广眚目检文本」这种 3/10 字出错的情况仍算通过。
+        """
+        import difflib
+
+        a = self._norm_input(expected)
+        b = self._norm_input(got)
+        if not a:
+            return True
+        if a in b:
+            return True
+        if len(b) < len(a):
+            return False
+        best = 0.0
+        for i in range(len(b) - len(a) + 1):
+            ratio = difflib.SequenceMatcher(
+                None, a, b[i:i + len(a)]).ratio()
+            if ratio > best:
+                best = ratio
+                if best >= threshold:
+                    return True
+        return False
+
     def _clear_input(self) -> None:
         """清空输入框；失败也不抛，由调用方返回明确的失败原因。"""
         try:
-            self.focus_input()
+            if not self._focus_input_via_post():
+                self.focus_input()
             self._input.key(VK_A, ctrl=True)
             self._input.key(VK_DELETE)
         except Exception:
             pass
 
+    def _focus_input_via_post(self) -> bool:
+        """用 PostMessage 点输入框获得焦点，不移动真实鼠标。
+
+        群聊里必须先让输入框聚焦，发送按钮才会响应；这一下走消息投递，
+        微信可能自己把窗口激活一次，但不会移动用户的光标。
+        """
+        try:
+            uia = self._get_uia()
+        except Exception:
+            return False
+        if uia is None or getattr(uia, '_win', None) is None:
+            return False
+        edit = uia._chat_input()
+        if edit is None:
+            return False
+        if not uia._post_click_ctrl(edit):
+            return False
+        time.sleep(0.3)
+        return True
+
+    def _append_text(self, text: str) -> bool:
+        """在输入框末尾追加文本，不移动键鼠、不要求窗口在前台。
+
+        走 WM_CHAR 消息投递；换行与 emoji 会被微信丢弃（2026-11-19 实测），
+        遇到这类字符返回 False，由调用方回退到逐字键入并先校验前台。
+        """
+        if not text:
+            return True
+        if any(ord(ch) > 0xFFFF or ch in '\r\n' for ch in text):
+            return False
+        try:
+            uia = self._get_uia()
+        except Exception:
+            return False
+        if uia is None or getattr(uia, '_win', None) is None:
+            return False
+        hwnd = uia._win.NativeWindowHandle
+        if not hwnd:
+            return False
+        data = text.encode('utf-16-le')
+        for i in range(0, len(data), 2):
+            cp = int.from_bytes(data[i:i + 2], 'little')
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0102, cp, 1)
+            time.sleep(0.006)
+        return True
+
     def at_member(self, member: str, text: str, who: Optional[str] = None,
                   verify: bool = False) -> WxResponse:
         """在群聊中 @ 成员后追加发送 text。
 
-        流程：输入框键入 '@' → OCR 成员选择弹层定位成员 → 点击 →
-        不清空输入框，直接在 @ token 后逐字打字 → 读回 @name 和正文 →
-        两者都对上才发送。读不回来/对不上就清空并返回失败，**不回退成
-        纯文本 @**。
+        这条路径**需要真实键盘焦点**：微信只对键盘输入的 `@` 弹成员层，
+        `ValuePattern.SetValue('@')` / `SetValue('@强')` 实测都不弹（2026-11-19），
+        而成员层的点击也必须落在真实前台窗口上。所以这里显式抢前台，
+        并用 finally 保证无论成败都把前台还给调用前的那个窗口。
+        普通文本发送不走这条路，仍然全程 PostMessage 不抢前台。
+        """
+        u = getattr(self._input, '_user32', None)
+        prev_fg = u.GetForegroundWindow() if u is not None else 0
+        try:
+            return self._at_member_inner(member, text, who, verify)
+        finally:
+            # 只在原前台不是微信、且窗口仍然存在时归还；
+            # 归还失败不影响本次发送结果，只是用户要多点一下切回去。
+            if (u is not None and prev_fg
+                    and prev_fg != getattr(self, 'main_hwnd', 0)
+                    and u.IsWindow(prev_fg)):
+                try:
+                    u.SetForegroundWindow(prev_fg)
+                except Exception as e:
+                    wxlog.debug(f'at_member 归还前台失败：{e!r}')
+
+    def _at_member_inner(self, member: str, text: str,
+                         who: Optional[str] = None,
+                         verify: bool = False) -> WxResponse:
+        """at_member 的实际流程；前台抢占与归还在外层包装里。
+
+        流程：输入框键入 '@' → 成员弹层定位成员 → 点击 → 不清空输入框，
+        直接在 @ token 后逐字打字 → 读回 @name 和正文 → 两者都对上才发送。
+        读不回来/对不上就清空并返回失败，**不回退成纯文本 @**。
         """
         # @ 消息落库正文带有「@昵称」包装，只能包含匹配；水位见 _send_watermark。
         mark = self._send_watermark(who) if verify else None
-        if not self.ensure_visible():
+        # 直接 bring_to_front，不走 ensure_visible：后者的 15 秒缓存会在
+        # 之前任何一次 ensure_visible() 之后短路返回 True，导致这里根本没抢前台。
+        if not self.bring_to_front():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
             if not self.open_chat(who):
                 return WxResponse.failure(f'打开会话失败：{who}',
                                           data={'reason': 'at_failed'})
             time.sleep(0.8)
-        if not self.focus_input():
+        if not self._focus_input_via_post() and not self.focus_input():
             return WxResponse.failure('输入框不可用')
         # 先清掉可能残留的草稿，否则 @ 不在开头时微信不弹成员列表。
         self._input.key(VK_A, ctrl=True)
@@ -2964,79 +3714,68 @@ class WeChatGUI:
             return WxResponse.failure('输入框不可用',
                                       data={'at_name': member,
                                             'reason': 'at_failed'})
-        self._last_input_box = box
-        # UIA 的 MentionPopover 是成员弹层的权威控件；OCR 只作回退。
+        self._remember_input_box(box)
+        # 认人以 UIA 的 ListItem.Name 为准：弹层是半透明浮层，OCR 读不出
+        # （实测「强」→「弓虽」/空）。UIA 拿不到弹层时退回「点第一行」，
+        # 由下面的读回校验兜底——点错人读回的 @名字 对不上就清空不发。
         uia_at_name = None
         item = self._uia_mention_item(member, core)
         if item is not None:
             uia_at_name = (item.Name or '').strip()
-            try:
-                item.Click()
-            except Exception as e:
-                wxlog.debug(f'点击 UIA @ 成员失败，改按坐标：{e!r}')
-                r = item.BoundingRectangle
-                self.wx_click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+            _u = self._get_uia()
+            clicked = (_u is not None and _u._post_click_ctrl(item))
+            if not clicked:
+                try:
+                    item.Click()
+                except Exception as e:
+                    wxlog.debug(f'点击 UIA @ 成员失败，改按坐标：{e!r}')
+                    r = item.BoundingRectangle
+                    self.wx_click((r.left + r.right) // 2,
+                                  (r.top + r.bottom) // 2)
         else:
-            # 回退：成员弹层是独立顶层窗口（Qt…ToolSaveBits / Weixin），
-            # 也可能画在主窗里；两种都扫。
             popup_win = self._find_at_popup_window(box)
-            if popup_win:
-                items = self.ocr_abs(popup_win)
-                absolute = True
-            else:
-                popup = (0, max(80, box[1] - 500), self.render_w, box[1])
-                items = self.ocr(popup)
-                absolute = False
-            full = member.replace(' ', '')
-            cands = []
-            for t, x, yy, w, h in items:
-                tn = (t or '').replace(' ', '')
-                if (full and full in tn) or (core and core in tn) \
-                        or (member and member in t):
-                    cands.append((t, x, yy, w, h))
-            target = None
-            if cands:
-                # 弹层紧贴输入框上方，消息正文在更上面；取 y 最大的那条，
-                # 防止正文里出现同样的名字时点到消息区。
-                _t, x, yy, w, h = max(cands, key=lambda it: it[2])
-                target = rhythm.point((x, yy, x + w, yy + h))
-                if not absolute:
-                    target = (target[0] + self.origin_x,
-                              target[1] + self.origin_y)
-            if not target:
+            if not popup_win:
                 self._clear_input()
                 return WxResponse.failure(f'未在成员列表中找到：{member}',
                                           data={'at_name': member,
                                                 'reason': 'at_failed'})
-            self.wx_click(target[0], target[1])
+            left, top, right, bottom = popup_win
+            first_row_y = top + max(12, (bottom - top) // 8)
+            self.wx_click((left + right) // 2, first_row_y)
         time.sleep(0.6)
         got = self.read_input_text()
         if not got:
             self._clear_input()
             return WxResponse.failure(
-                '@对象未读回（输入框 UIA 不可用或为空），未发送',
+                '@对象未读回（输入框截图 OCR 为空），未发送',
                 data={'at_name': member, 'at_token_ok': False,
                       'body_ok': False, 'reason': 'at_unverified'})
         at_norm = self._norm_input(got)
         full_norm = self._norm_input('@' + member)
         core_norm = self._norm_input('@' + core)
         if uia_at_name:
-            # UIA 输入框把 @ token 读成对象替换符 \ufffc，@ 后面的名字
-            # 不进入 ValuePattern；成员名以 UIA 弹层选中的 ListItem 为准。
+            # 真 @ token 在输入框里是对象替换符 \ufffc，名字不进入 Value；
+            # 此时以 UIA 弹层里选中的 ListItem.Name 作为「@ 到了谁」的依据。
             selected_norm = self._norm_input(uia_at_name)
-            member_norm = self._norm_input(member)
-            core_plain = self._norm_input(core)
-            token_ok = bool(at_norm) and ('\ufffc' in got or '@' in got) and (
-                member_norm in selected_norm or core_plain in selected_norm)
+            token_ok = bool(at_norm) and (
+                '\ufffc' in got or '@' in got) and (
+                self._norm_input(member) in selected_norm
+                or self._norm_input(core) in selected_norm)
         else:
-            token_ok = bool(at_norm) and '@' in at_norm and (
-                full_norm in at_norm or core_norm in at_norm)
+            # 没能从 UIA 弹层认出成员，只点了弹层第一行。此时输入框里就算
+            # 出现「@名字」也证明不了它是真 @ token——点到弹层空白处同样会
+            # 留下这段纯文本（2026-11-20 核实：原实现用 `'@' in at_norm`
+            # 判定，会把「点空了」报成真 @ 成功，属于漏报）。
+            # 这里一律判未验证，由调用方决定是否降级成纯文本发送。
+            token_ok = False
         if not token_ok:
             self._clear_input()
+            # UIA 认了人却读回对不上 = token 不一致；压根没认到人 = 无法验证。
+            reason = 'at_token_mismatch' if uia_at_name else 'at_unverified'
             return WxResponse.failure(
                 '@对象读回不一致，未发送',
                 data={'at_name': member, 'at_token_ok': False,
-                      'body_ok': False, 'reason': 'at_token_mismatch'})
+                      'body_ok': False, 'reason': reason})
         body_ok = not text
         if text:
             # 关键：不要调用 input_text()——它会先 Ctrl+A/Delete，把 @ token
@@ -3044,14 +3783,15 @@ class WeChatGUI:
             rhythm.type_text(text)
             time.sleep(0.2)
             got2 = self.read_input_text()
-            body_norm = self._norm_input(text)
+            # OCR 会把形近字认错（实测「告」→「眚」、「检」→「目」），
+            # 所以正文不能要求精确子串，改用相似度；@ 与成员名仍然精确匹配。
+            body_ok = self._ocr_text_match(text, got2)
             at_norm2 = self._norm_input(got2)
-            body_ok = bool(body_norm) and body_norm in at_norm2
             if uia_at_name:
-                token_ok = bool(at_norm2) and ('\ufffc' in got2 or '@' in got2)
+                token_ok = bool(at_norm2) and (
+                    '\ufffc' in got2 or '@' in got2)
             else:
-                token_ok = bool(at_norm2) and '@' in at_norm2 and (
-                    full_norm in at_norm2 or core_norm in at_norm2)
+                token_ok = False      # 同上：没有 UIA 认人就无法证明是真 @
             if not body_ok or not token_ok:
                 self._clear_input()
                 reason = 'at_body_mismatch' if not body_ok else 'at_token_mismatch'

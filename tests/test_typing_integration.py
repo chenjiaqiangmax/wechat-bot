@@ -78,7 +78,7 @@ class TestUiaSendText(unittest.TestCase):
     def _uia(self):
         u = object.__new__(uia_driver.WeChatUIA)
         e = _FakeElement()
-        u.ensure_window = lambda: True
+        u.ensure_window = lambda *a, **kw: True
         u._chat_input = lambda: e
         u._click_ctrl = lambda ctrl: True
         u._paste_into = mock.Mock(

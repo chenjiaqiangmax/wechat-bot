@@ -57,6 +57,14 @@ class WxParam:
     # 会折算成输入框里实际的 U+FFFC 占位符，折算后是 1.0。
     SEND_CONTENT_RATIO: float = 0.6
 
+    # 发送时用「UIA 写值 + PostMessage 点发送按钮」，而不是逐字键入 + 回车。
+    # 2026-11-19 真机实测：发送按钮的 Invoke 是空操作，PostMessage 鼠标消息有效；
+    # ValuePattern.SetValue 能完整写入换行与 emoji（WM_CHAR 会丢这两类字符）。
+    # 代价：微信在写值和点击时会自己把窗口激活一次（约 1 秒），外部阻止不了；
+    # 收益：不移动真实鼠标、不逐字打字，单条从 10–15 秒降到 1 秒内。
+    # 置 False 回退旧的逐字键入 + 回车路径。
+    SEND_VIA_POSTMESSAGE: bool = True
+
     # 是否允许使用 OCR（Windows 自带 WinRT 识别）作为定位/判据手段。
     # 默认开。关掉后所有 OCR 调用一律返回空结果，相关功能改走 UIA 控件树；
     # 没有 UIA 等价物的地方会**明确失败而不是盲猜坐标**，例如：
@@ -64,6 +72,27 @@ class WxParam:
     # 影响面：发送主路径（UIA）不受影响；像素探针类判断（输入框定位、
     # 面板非空白、高亮行检测）不依赖 OCR，仍然可用。
     ENABLE_OCR: bool = True
+
+    # 是否启用 UIA 控件树（uia_driver）。**默认关闭**（2026-11-20 用户拍板）。
+    #
+    # 为什么要关：参考项目 jev-chat-windows 完全不依赖 UIA（WGC 截图 + WinRT
+    # OCR + 剪贴板粘贴），本项目也不再走微信内部控件树那条路。
+    #
+    # 关掉之后必须同时打开 ALLOW_OCR_CHAT_FALLBACK，否则连会话都打不开。
+    # 真实代价（用户已知悉并接受）：
+    #   1. 打开会话走「OCR + 真实鼠标点击」，会 SetCursorPos 移动用户光标、
+    #      把微信顶到前台——是这套方案的固有成本；
+    #   2. 发送退回逐字键入 + 回车（单条 10–15 秒）；
+    #   3. 真 @ 做不了：at_member 一律失败，关键词广告需降级为纯文本前缀；
+    #   4. 独立聊天窗口发送直接失败。
+    # 想换回「不碰鼠标」的旧行为：把这里改回 True 并关掉 ALLOW_OCR_CHAT_FALLBACK。
+    ENABLE_UIA: bool = False
+
+    # 打开会话时，UIA 搜不到是否允许回退到「OCR + 真实鼠标点击」的侧栏路径。
+    # **默认开启**（2026-11-20 用户拍板，接受移动鼠标）：ENABLE_UIA 关掉后
+    # 这是唯一能打开会话的路，关着它就等于整个发送链路不可用。
+    # 这条路径会 SetCursorPos 移动用户光标、把微信顶到前台，是方案本身的成本。
+    ALLOW_OCR_CHAT_FALLBACK: bool = True
 
 class WxResponse(dict):
     def __init__(self, status: str, message: str, data: dict = None):

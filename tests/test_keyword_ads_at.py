@@ -61,6 +61,17 @@ class _FakeMemberChat:
         return self.members
 
 
+class _FakeListItem:
+    """UIA 弹层里的成员项：只要 Name 和 Click，够 at_member 走完认人分支。"""
+
+    def __init__(self, name):
+        self.Name = name
+        self.clicked = 0
+
+    def Click(self):
+        self.clicked += 1
+
+
 class TestResolveAtName(unittest.TestCase):
     def test_unique_member(self):
         chat = _FakeMemberChat([
@@ -126,7 +137,15 @@ class TestAtMemberReadback(unittest.TestCase):
 
     def _gui(self, read_values, click_ok=True, verify_ok=True):
         gui = object.__new__(guia.WeChatGUI)
-        gui.ensure_visible = lambda: True
+        gui.ensure_visible = lambda *a, **kw: True
+        # at_member 现在显式抢前台（真 @ 必须真实键盘焦点），替身里直接放行。
+        gui.bring_to_front = lambda *a, **kw: True
+        # 成员弹层不再 OCR 认名字，改为按窗口矩形点第一行；替身给一个固定矩形。
+        gui._find_at_popup_window = lambda box: (0, 0, 200, 80)
+        # UIA 认人是真 @ 的唯一依据：替身里默认认到「张三」，需要认不到的
+        # 用例自己覆盖成 lambda *a: None。
+        gui._uia_mention_item = lambda member, core: _FakeListItem('张三')
+        gui.wx_click = lambda x, y: None
         gui.open_chat = lambda who: True
         gui.focus_input = lambda: True
         gui._input = _FakeInput()
@@ -170,17 +189,30 @@ class TestAtMemberReadback(unittest.TestCase):
         self.assertTrue(r['data']['at_token_ok'])
         self.assertTrue(r['data']['body_ok'])
 
-    def test_token_mismatch_clears_and_does_not_send(self):
-        gui = self._gui(['@李四'])
+    def test_unrecognised_member_fails_closed(self):
+        """UIA 认不到人时不能拿输入框里的纯文本「@张三」冒充真 @。"""
+        gui = self._gui(['@张三'])
+        gui._uia_mention_item = lambda *a: None
         typed = []
         with mock.patch.object(guia.rhythm, 'type_text',
                                side_effect=lambda text: typed.append(text)):
             r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
         self.assertFalse(r.is_success)
-        self.assertEqual(r['data']['reason'], 'at_token_mismatch')
+        self.assertEqual(r['data']['reason'], 'at_unverified')
         self.assertEqual(gui.cleared, 1)
         self.assertEqual(gui.clicked, 0)
         self.assertEqual(typed, [])
+
+    def test_token_mismatch_clears_and_does_not_send(self):
+        """UIA 认到的人与读回对不上时按 token 不一致处理。"""
+        gui = self._gui(['@张三'])
+        gui._uia_mention_item = lambda *a: _FakeListItem('李四')
+        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
+            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        self.assertFalse(r.is_success)
+        self.assertEqual(r['data']['reason'], 'at_token_mismatch')
+        self.assertEqual(gui.cleared, 1)
+        self.assertEqual(gui.clicked, 0)
 
     def test_body_mismatch_clears_and_does_not_send(self):
         gui = self._gui(['@张三', '@张三'])
@@ -230,48 +262,6 @@ class TestAtMemberReadback(unittest.TestCase):
                                          verify=True)
         self.assertTrue(r.is_success, r)
         self.assertGreaterEqual(calls['n'], 2)
-
-    def test_uia_token_is_object_replacement_and_name_comes_from_item(self):
-        """UIA 输入框把 @token 读成 \\ufffc；成员名以选中的 ListItem 为准。"""
-        gui = self._gui(['\ufffc', '\ufffc你好'])
-
-        class Item:
-            Name = '张三'
-
-            def __init__(self):
-                self.clicked = 0
-
-            def Click(self):
-                self.clicked += 1
-
-        item = Item()
-        gui._uia_mention_item = lambda member, core: item
-        gui.ocr = lambda box: []
-        typed = []
-        with mock.patch.object(guia.rhythm, 'type_text',
-                               side_effect=lambda text: typed.append(text)):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
-        self.assertTrue(r.is_success)
-        self.assertEqual(item.clicked, 1)
-        self.assertEqual(typed, ['你好'])
-        self.assertTrue(r['data']['at_token_ok'])
-        self.assertTrue(r['data']['body_ok'])
-        self.assertEqual(gui.clicked, 1)
-
-    def test_mention_item_prefers_exact_and_rejects_ambiguous(self):
-        class Item:
-            def __init__(self, name):
-                self.Name = name
-
-        exact = Item('张三')
-        self.assertIs(
-            guia.WeChatGUI._pick_mention_item(
-                [Item('张三丰'), exact], '张三', '张三'), exact)
-        self.assertIsNone(guia.WeChatGUI._pick_mention_item(
-            [Item('张三丰'), Item('张三郎')], '张三', '张三'))
-        self.assertIsNone(guia.WeChatGUI._pick_mention_item(
-            [Item('张三'), Item('张三')], '张三', '张三'))
-
 
 if __name__ == '__main__':
     unittest.main()
