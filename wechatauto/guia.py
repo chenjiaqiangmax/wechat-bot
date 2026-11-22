@@ -269,6 +269,27 @@ def _restore_keep_maximize(user32, hwnd: int):
     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
 
 
+def _blank_frame(image, white: int = 245, ratio: float = 0.92) -> bool:
+    """jev 同款白帧判据：≥ratio 的采样像素接近纯白视为白屏。
+
+    微信 4.x 是 Qt 自绘窗口，从托盘还原/被激活后渲染线程重绘有延迟，
+    这期间 WGC 抓到的是白帧——OCR 读空，表现为「搜索浮层没出现」「会话
+    没打开」。抓不到帧（None）也按白屏处理，交给上层等待重试。
+    """
+    if image is None:
+        return True
+    try:
+        rgb = image.convert('RGB')
+        sample = rgb.resize((max(1, min(rgb.width, 120)),
+                             max(1, min(rgb.height, 80))))
+        pixels = list(sample.getdata())
+        white_px = sum(1 for p in pixels
+                       if p[0] >= white and p[1] >= white and p[2] >= white)
+        return white_px / max(1, len(pixels)) >= ratio
+    except Exception:
+        return False
+
+
 def window_owner_pid(x: int, y: int) -> Optional[int]:
     """屏幕坐标 (x, y) 处最上层窗口所属的进程 id；探测失败返回 None。
 
@@ -637,7 +658,62 @@ def _chat_name_score(ocr_name: str, target: str) -> int:
         # 多出来的若是数字/文字，就是另一个会话名（如「目标群2」），不是装饰。
         if not re.search(r'[\w\u4e00-\u9fff]', extra):
             return 1
+        # 企业微信互通联系人显示「名字@企业名」（实测 openim 用户「代清艺」
+        # 在搜索浮层里是「代清艺@小来」），@ 后缀是平台装饰，不是另一个会话。
+        if extra.startswith('@'):
+            return 1
     return 0
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """两短串的 Levenshtein 距离（OCR 行都是十几字以内，O(n*m) 足够）。"""
+    prev = list(range(len(a) + 1))
+    for i, bc in enumerate(b, 1):
+        cur = [i]
+        for j, ac in enumerate(a, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ac != bc)))
+        prev = cur
+    return prev[-1]
+
+
+def _fuzzy_name_match(text: str, target: str) -> bool:
+    """统一模糊层（独立函数，便于对通讯录全量做误配回归）。
+
+    判据两条：① 清洗后编辑距离 ≤ 2(装饰预算) + len/5(替换预算)；
+    ② 数字子序列 cand ⊆ wanted（容忍丢数字，不容忍多出/不同的数字）。
+    只对 ≥6 字的目标启用；短名交给精确层与 @ 分支。
+    """
+    wanted = ''.join((target or '').casefold().split())
+    if len(wanted) < 6:
+        return False
+    cand = ''.join(ch for ch in (text or '').casefold()
+                   if ch.isalnum() or '\u4e00' <= ch <= '\u9fff')
+    digits = lambda s: ''.join(ch for ch in s if ch.isdigit())
+    dw, dc = digits(wanted), digits(cand)
+    it = iter(dw)
+    if not all(ch in it for ch in dc):
+        return False
+    return _edit_distance(cand, wanted) <= 2 + len(wanted) // 5
+
+
+def _openim_title_match(text: str, target: str) -> bool:
+    """openim 会话标题碎读容错。
+
+    实测「代清艺」的会话标题被 OCR 读成「青艺@小米」（丢首字 + 清→青），
+    ``_chat_name_score`` 与 ``_title_similar`` 一格容错都救不了。判据收窄：
+    行含 @（openim 特征）、@ 前段与目标名编辑距离 ≤2、且尾字相同——
+    「代清华@小米」这类真近名尾字不同，不会误配。
+    """
+    if '@' not in (text or '') or not target:
+        return False
+    name_part = ''.join(text.split('@')[0].casefold().split())
+    wanted = ''.join(target.casefold().split())
+    if not name_part or not wanted or len(wanted) < 3:
+        return False
+    if name_part[-1] != wanted[-1]:
+        return False
+    return _edit_distance(name_part, wanted) <= 2
 
 
 def _capture_window_frame(hwnd: int) -> Optional[Image.Image]:
@@ -793,18 +869,38 @@ def _display_name_for(name: str):
 # 浮层里分区标题的位置：这些行以下就不是「联系人」了
 _POPUP_SECTION_TITLES = ('群聊', '公众号', '全部')
 
+# OCR 对浮层里的微信号小字经常把形近字符读混：实测
+# cx1666688888 被读成 cxl666688888（1→l）。比对前两边都归一，
+# 1/l/I/| 视作同一字符、0/o 视作同一字符，其余非字母数字一律丢掉。
+_OCR_CONFUSE = str.maketrans({'l': '1', 'i': '1', '|': '1', 'o': '0'})
+
+# 群聊项的固定格式是「包含：昵称（微信号：xxx）」，它同样含 alias，
+# 点进去就发到群里。分区标题 OCR 认错时靠这个词兜底。
+_POPUP_GROUP_ROW_MARKERS = ('包含',)
+
+
+def _normalize_ocr_alias(text: str) -> str:
+    """归一化用于比对的文本：只留字母数字，1/l/I、0/o 统一。
+
+    OCR 与数据库两边的字符串都过这个函数再比，形近字符差异不影响命中。
+    """
+    return ''.join(
+        ch for ch in (text or '').lower().translate(_OCR_CONFUSE)
+        if ch.isalnum())
+
 
 def _popup_alias_row(rows: list, alias: str, frame_height: int):
     """按微信号在搜索浮层里定位联系人。
 
-    搜微信号时联系人项在最上面，下面「群聊」区会列出「包含：昵称（微信号）」
-    的群——它们同样含这个 alias，点进去就发错地方。所以下界取第一个分区
-    标题的 y，只在其上找；没有分区标题时退回浮层上半区的比例上限。
+    搜微信号时联系人项在最上面，下面「群聊」区会列出「包含：昵称（微信号）
+    的群——它们同样含这个 alias，点进去就发错地方。先按分区标题压上界，
+    再把含「包含」的群聊项整行排除。比对用 :func:`_normalize_ocr_alias`
+    归一化，容忍 OCR 把 1 读成 l 这类形近错误。
     同一 alias 命中多行时取最靠上的（联系人区在前）。
     """
     if not rows or frame_height <= 0:
         return None
-    needle = (alias or '').strip().lower()
+    needle = _normalize_ocr_alias(alias)
     if len(needle) < 3:
         return None
     limit = frame_height * SEARCH_POPUP_MAX_Y_RATIO
@@ -812,8 +908,15 @@ def _popup_alias_row(rows: list, alias: str, frame_height: int):
         label = (text or '').strip()
         if any(t in label for t in _POPUP_SECTION_TITLES) and len(label) <= 8:
             limit = min(limit, y)
-    hits = [row for row in rows
-            if row[2] < limit and needle in (row[0] or '').lower()]
+    hits = []
+    for row in rows:
+        label = (row[0] or '').strip()
+        if row[2] >= limit:
+            continue
+        if any(mark in label for mark in _POPUP_GROUP_ROW_MARKERS):
+            continue
+        if needle in _normalize_ocr_alias(label):
+            hits.append(row)
     return min(hits, key=lambda row: row[2]) if hits else None
 
 
@@ -827,17 +930,45 @@ def _popup_result_row(rows: list, target: str, frame_height: int):
     if not rows or frame_height <= 0:
         return None
     limit = frame_height * SEARCH_POPUP_MAX_Y_RATIO
+    wanted = ''.join((target or '').casefold().split())
+    # 「搜索网络结果」分区标题 OCR 常读碎（实测「瘦索网结果」），认不出精确
+    # 文本，按「含网 + 含结果」找它；其下是网络候选，点它只会跳网页，整段排除。
+    net_y = None
+    for text, x, y, w, h in rows:
+        label = (text or '').strip()
+        if ('网' in label and '结果' in label and len(label) <= 8):
+            net_y = y if net_y is None else min(net_y, y)
     scored = []
     for text, x, y, w, h in rows:
-        if y > limit:
+        if y > limit or (net_y is not None and y >= net_y):
             continue
         score = _chat_name_score(text, target)
+        if not score and '@' in (text or '') and len(wanted) >= 3:
+            # openim 联系人行 OCR 读得很碎（实测「代清艺@小来」会被读成
+            # 「亻弋清艺@小米」，「代」拆成「亻弋」），短名（<6 字）交给
+            # @ 分支：行含 @ 且 @ 前段以目标名尾部连续 2 字结尾仍算候选。
+            name_part = ''.join(text.split('@')[0].casefold().split())
+            if name_part.endswith(wanted[-2:]):
+                score = 1
+        if not score and _fuzzy_name_match(text, target):
+            # 统一模糊层（2026-11-22 重构，替代「编辑距离≤1」「连续公共子串」
+            # 两个逐例补丁）：OCR 错误形态（前后缀装饰、形近替换、丢失、插入）
+            # 全部表现为清洗后编辑距离变大，身份差异表现为数字子序列不同；
+            # 判据与阈值见 _fuzzy_name_match。新增错误形态无需再改代码。
+            score = 2
         if score:
             scored.append((score, (text, x, y, w, h)))
     if not scored:
         return None
     best = max(score for score, _row in scored)
     top = [row for score, row in scored if score == best]
+    if best <= 2 and len({row[0] for row in top}) > 1:
+        # 模糊层（≤2 分）命中了多个不同行：通讯录里存在真实近名对（全量检测
+        # 实测「Harvey妈妈/Harvey老狼」「AI开发/AI实战交流群」互判），文本判据
+        # 分不清「OCR 读错」和「就是另一个会话」。宁可失败不猜——歧义即放弃，
+        # 交给下一轮重试（OCR 每轮读法不同，常能读对一次）。
+        wxlog.debug(f'搜索浮层模糊候选歧义（{len(top)} 行同分），放弃猜测')
+        return None
     return sorted(top, key=lambda row: row[2])[0]
 
 
@@ -1601,6 +1732,63 @@ class WeChatGUI:
             wxlog.info(f'已还原遮挡窗口 {len(done)} 个')
         return len(done)
 
+    def _main_window_shown(self) -> bool:
+        """主窗口是否真的显示在屏幕上（收进托盘/被隐藏/被关闭时为 False）。"""
+        try:
+            style = ctypes.windll.user32.GetWindowLongW(self.main_hwnd, -16)
+        except Exception:
+            return False
+        return bool(style & 0x10000000)      # WS_VISIBLE
+
+    def _restore_hidden_window(self) -> bool:
+        """窗口被收进托盘/隐藏时还原一次，返回当前是否可见。
+
+        微信点关闭默认收进托盘，窗口变 ``WS_VISIBLE=False``——此时
+        ``is_alive()`` 仍为 True、WGC 还能抓到最后一帧缓存画面，看上去像
+        正常界面，但点击和按键全部落空。2026-11-20 深夜的发送失败就是
+        这个状态叠在 OCR 认错微信号上。
+        """
+        if self._main_window_shown():
+            return True
+        try:
+            # 用 _restore_keep_maximize：它先查 GetWindowPlacement，
+            # 最大化的窗口用 SW_SHOWMAXIMIZED 还原，不会被缩成普通尺寸。
+            _restore_keep_maximize(ctypes.windll.user32, self.main_hwnd)
+            time.sleep(0.4)
+        except Exception as e:
+            wxlog.debug('还原隐藏的微信窗口失败：%s', e)
+        if self._main_window_shown():
+            wxlog.info('微信主窗口原本不可见（收进托盘/被隐藏），已自动还原')
+            self._update_render_rect()
+            # 还原后 Qt 渲染有延迟，立即 OCR 会抓到白屏帧（用户实测
+            # 「激活微信窗口有时候会白屏」）；等渲染完成再返回。
+            self._wait_render()
+            return True
+        wxlog.warning('微信主窗口不可见（已收进托盘或关闭），界面操作无法进行，'
+                      '请打开微信窗口后重试')
+        return False
+
+    def _wait_render(self, timeout: float = 2.0) -> bool:
+        """等待主窗口渲染完成（非白屏），返回是否等到。
+
+        有界等待：白屏是还原/激活后的暂时状态，渲染完成即返回；若超过
+        timeout 仍是白屏（渲染线程卡死，jev 实测存在），返回 False 让
+        调用方按可见性失败处理，不进入无限探测。
+        """
+        try:
+            rect = self._rel_to_screen((0, 0, self.render_w, self.render_h))
+        except Exception:
+            return True
+        deadline = time.time() + timeout
+        while True:
+            if not _blank_frame(self._grab_screen(rect)):
+                return True
+            if time.time() >= deadline:
+                wxlog.warning('微信窗口还原/激活后持续白屏 %.1fs，'
+                              '疑似渲染卡死，本轮按失败处理', timeout)
+                return False
+            time.sleep(0.3)
+
     def ensure_visible(self, keep_topmost: bool = False,
                        activate: bool = False) -> bool:
         """把微信置于前台；不再最小化任何其他程序的窗口。
@@ -1619,9 +1807,15 @@ class WeChatGUI:
         批量发送会逐条调用本方法，为避免每条都重复抢前台（上轮实测每次
         开销 20s+），15 秒内已成功前置过且窗口仍存活则直接复用。
 
-        可见性仅以主窗口句柄存活判定（不依赖截图白屏采样），
-        控件定位走 UIA，不依赖桌面截图。
+        可见性以主窗口 ``WS_VISIBLE`` 为准（不依赖截图白屏采样）：微信被
+        收进托盘/隐藏时进程与句柄都还在，``is_alive()`` 仍是 True，但真实
+        鼠标键盘全都落空——先自动 ``ShowWindow(SW_RESTORE)`` 还原一次，
+        还原不了直接返回 False，让调用方快速失败而不是重试到超时。
         """
+        if not self._restore_hidden_window():
+            self._last_visible_ok = False
+            self._last_visible_ts = time.time()
+            return False
         if (getattr(self, '_last_visible_ok', False)
                 and getattr(self, '_last_visible_ts', 0) > time.time() - 15
                 and self.is_alive()):
@@ -1641,8 +1835,10 @@ class WeChatGUI:
             self._last_visible_ts = time.time()
             return ok
         brought = self.bring_to_front(keep_topmost=keep_topmost)
-        time.sleep(0.5)
         self._update_render_rect()
+        # 激活后同样可能白屏：等待渲染完成替代固定 0.5s（快时更快，
+        # 慢时最多多等 ~1.5s，防止把白屏帧交给 OCR）。
+        self._wait_render()
         ok = bool(brought) and self.is_alive()
         self._last_visible_ok = ok
         self._last_visible_ts = time.time()
@@ -2291,8 +2487,11 @@ class WeChatGUI:
                 '设为 True', name)
             return False
         # 保持现有坐标输入契约：真实点击前仍需激活窗口，退出时由装饰器恢复层级。
+        # 窗口不可用（隐藏/抢不到前台）时直接放弃：OCR 回退全靠真实鼠标，
+        # 没有可见窗口就只剩一连串落空的点击。
         if not self.ensure_visible(keep_topmost=True, activate=True):
-            wxlog.warning('无法将微信窗口置于前台，尝试继续操作')
+            wxlog.warning('微信窗口不可用（已隐藏或抢不到前台），放弃 OCR 打开会话：%r', name)
+            return False
         self._update_render_rect()
         if self._chat_is_open(name) and self._pane_has_content():
             self._current_chat = name
@@ -2400,6 +2599,8 @@ class WeChatGUI:
                     return True
                 if _title_similar(_chat_name_key(text), _chat_name_key(name)):
                     return True
+                if _openim_title_match(text, name):
+                    return True
             return False
         except Exception as exc:
             wxlog.debug(f'标题片段匹配失败：{exc!r}')
@@ -2451,7 +2652,9 @@ class WeChatGUI:
         # 搜索框要靠真实键盘输入，必须让微信回到前台并拿到焦点。OCR 回退本来
         # 就是这个契约；只调 bring_to_front 不够——实测紧接着的点击/按键常
         # 落在还没接管焦点的窗口上，浮层根本不出现。
-        self.ensure_visible(keep_topmost=True, activate=True)
+        if not self.ensure_visible(keep_topmost=True, activate=True):
+            wxlog.warning('微信窗口不可用（已隐藏或抢不到前台），放弃本次搜索：%r', name)
+            return False
         time.sleep(0.4)
         anchor = rhythm.point(self._rel_to_screen(self.search_box))
         cx, cy = anchor

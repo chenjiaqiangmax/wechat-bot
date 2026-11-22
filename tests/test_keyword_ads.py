@@ -119,6 +119,32 @@ class TestEngine(KeywordAdsTestBase):
         d4 = e2.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 60)
         self.assertEqual(d4['reason'], 'cooldown')
 
+    def test_note_fail_short_backoff(self):
+        """发送失败只退避 5 分钟，不占满 30 分钟冷却。
+
+        2026-11-22 定案：失败若占满冷却，这条广告等于丢掉；改成退避后
+        下一条命中消息就能重试。
+        """
+        e = self.engine()
+        now = time.time()
+        e.note_sent('on@chatroom', REPLY, now=now)
+        e.note_fail('on@chatroom', backoff_seconds=300.0, now=now)
+        d = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 100)
+        self.assertFalse(d['allowed'], '退避期内仍应冷却')
+        self.assertEqual(d['reason'], 'cooldown')
+        d2 = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 301)
+        self.assertTrue(d2['allowed'], '退避 5 分钟后应允许下一条命中重试')
+
+    def test_note_fail_without_prior_note_sent(self):
+        """@ 失败路径没有先 note_sent，note_fail 单独调用也要生效。"""
+        e = self.engine()
+        now = time.time()
+        e.note_fail('on@chatroom', backoff_seconds=300.0, now=now)
+        d = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 100)
+        self.assertEqual(d['reason'], 'cooldown')
+        d2 = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 301)
+        self.assertTrue(d2['allowed'])
+
     def test_disabled_group_does_not_even_match(self):
         d = self.engine().evaluate('便宜的模型', 'off@chatroom', '别的群')
         self.assertFalse(d['hit'])
@@ -346,6 +372,37 @@ class TestSoftMode(KeywordAdsTestBase):
             import json
             state = json.load(f)
         self.assertEqual(set(state), {'last_sent'})
+
+
+    def test_negation_guard_skips_denial_statements(self):
+        """否定句不算提问：2026-11-22 修复「没有靠谱的中转站推荐」误发。
+
+        11-19 14:04 实测：别人说「没有靠谱的中转站推荐」，机器人因含
+        「推荐」判成提问、@ 了人准备发广告。这里逐条钉住修后的判定。
+        """
+        words = ka.DEFAULT_INTENT_WORDS
+        # 否定句：命中意图词但句内带否定——一律不算提问
+        for text in ('没有靠谱的中转站推荐',
+                     '我不需要便宜的token',
+                     '别推荐中转站了',
+                     '这里没靠谱的渠道',
+                     '无需推荐，谢谢'):
+            self.assertFalse(ka.has_intent(text, words),
+                             f'{text!r} 是否定句，不该当提问')
+        # 正向提问：问号先行、或意图词句不带否定——照常触发
+        for text in ('哪里有便宜的 token？',
+                     '有没有靠谱的中转站？',
+                     '我想用便宜的token，在哪找？',
+                     '求个便宜的模型'):
+            self.assertTrue(ka.has_intent(text, words),
+                            f'{text!r} 是正常提问，不该被否定守卫拦下')
+
+    def test_youmeiyou_not_rejected_by_its_own_meiyou(self):
+        """「有没有」里的「没有」是疑问结构，不能被否定守卫误拒。"""
+        words = ['有没有', '推荐']
+        self.assertTrue(ka.has_intent('有没有靠谱的中转站', words))
+        self.assertTrue(ka.has_intent('有没有靠谱的中转站推荐', words))
+        self.assertFalse(ka.has_intent('没有靠谱的中转站', words))
 
 
 class TestBotWiring(KeywordAdsTestBase):

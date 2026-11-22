@@ -69,5 +69,56 @@ class TestConversationSendSteps(unittest.TestCase):
         self.assertEqual(convs[1]['steps'], [])
 
 
+class TestPendingUnconfirmedDoesNotPause(unittest.TestCase):
+    """补发遇「结果未确认」要保留待发、不暂停。
+
+    2026-11-21 08:23 实测：答案已入库（create_time 1795220614），但像素确认
+    没认到、被当成失败 → ``paused=True``，而 ``_retry_pending_replies`` 的
+    条件是 ``not self.paused``，恢复循环从此停摆，待发永远清不掉。
+    """
+
+    def _bot(self, err):
+        import threading
+        import dafeiyu_bot as m
+        bot = object.__new__(m.DaFeiYuBot)
+        bot.paused = False
+        bot._pending_lock = threading.Lock()
+        bot._pending_delivery_lock = threading.Lock()
+        bot._pending_delivered = set()
+        bot._pending_account_warned = set()
+        key = '["acct","default","chat","3"]'
+        bot._pending_replies = {
+            key: {'chat_id': 'chat', 'chat_name': '东耳映晓',
+                  'account': 'acct', 'answer': '你好呀，有什么事尽管说。',
+                  'after_seq': 3, 'rounds': 0}}
+        fake_db = type('DB', (), {'wxid': 'acct'})()
+        fake_chat = type('Chat', (), {
+            '_db': fake_db,
+            'SendMsg': lambda self, text: None,
+        })()
+        bot._pending_chats = {'chat': fake_chat}
+        bot._pending_wx = None
+        bot._save_pending_locked = lambda updated: None
+        bot._reply_recorded = staticmethod(lambda entry, db: False)
+        bot._send_retry = lambda fn, kind: (False, err)
+        return bot, key
+
+    def test_unconfirmed_keeps_pending_and_stays_running(self):
+        import dafeiyu_bot as m
+        bot, key = self._bot(m.UNCONFIRMED_SEND_MARK
+                             + '，为避免重复发送不再自动重试')
+        bot._flush_pending_replies()
+        self.assertFalse(bot.paused, '未确认不是键鼠失控，不能暂停应答')
+        self.assertIn(key, bot._pending_replies,
+                      '答案要留在待发等下一轮查库核对')
+        self.assertEqual(bot._pending_replies[key].get('rounds', 0), 0,
+                         '未确认不消耗补发轮数')
+
+    def test_real_failure_still_pauses(self):
+        bot, _key = self._bot('独立聊天窗口 UIA 发送失败，未尝试坐标回退')
+        bot._flush_pending_replies()
+        self.assertTrue(bot.paused, '真正的发送失败仍要暂停应答')
+
+
 if __name__ == '__main__':
     unittest.main()

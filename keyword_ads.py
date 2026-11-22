@@ -340,13 +340,37 @@ def group_mode(cfg: dict, chat_id: str, group_name: str = '') -> str:
     return mode if mode in ('hard', 'soft') else 'soft'
 
 
+# 否定守卫：意图词所在句里出现这些词就不算提问。2026-11-22 实测误判
+# 「没有靠谱的中转站推荐」——含「推荐」被当成提问，广告接在别人的否定
+# 陈述后面非常突兀。宁可误拒不误发（「特别推荐一家」会被拒，可接受）。
+DEFAULT_NEGATION_WORDS = [
+    '没有', '不用', '不需要', '不想', '无需', '不是', '别', '没',
+]
+
+_CLAUSE_SEP_RE = re.compile(r'[，。！？、；\n,!?;]+')
+
+
 def has_intent(text: str, words) -> bool:
-    """消息像不像在提问：有问号，或含任一意图词；不看大小写/空格。"""
+    """消息像不像在提问：有问号，或某一句里含意图词且不带否定。
+
+    「有没有」是疑问结构，里面的「没有」不是否定——扫描否定词前先把它
+    挖成占位符，避免「有没有靠谱的中转站」被自己的「没有」误拒。
+    """
     raw = str(text or '')
     if '?' in raw or '？' in raw:
         return True
     body = _norm(raw)
-    return any(_norm(w) and _norm(w) in body for w in (words or ()))
+    if not body:
+        return False
+    probe = body.replace('有没有', '\x00')
+    for clause, scan in zip(_CLAUSE_SEP_RE.split(body),
+                            _CLAUSE_SEP_RE.split(probe)):
+        if not any(_norm(w) and _norm(w) in clause for w in (words or ())):
+            continue
+        if any(_norm(n) and _norm(n) in scan for n in DEFAULT_NEGATION_WORDS):
+            continue
+        return True
+    return False
 
 
 def render_soft_reply(template: str, reply: str, keyword: str = '',
@@ -519,6 +543,26 @@ class Engine:
                     maxlen=8)
                 if not self._echoes[key]:
                     self._echoes.pop(key, None)
+            self._save_state_locked()
+
+    def note_fail(self, chat_id: str, backoff_seconds: float = 300.0,
+                  now: float = None) -> None:
+        """发送失败后的短退避：退避期内不撞，过后下一条命中就能重试。
+
+        ``note_sent`` 的全冷却是为「发送成功」设计的；失败若也占满 30 分钟，
+        这条广告等于丢掉（2026-11-22 用户定案：失败只退避 5 分钟，靠下一条
+        命中消息自然重试，保住时效）。冷却判定是 ``now2 - last < cooldown``，
+        把时间戳记成 ``now + backoff - cooldown``，冷却就恰好在
+        ``now + backoff`` 处到期。不记回显——消息没发出去，群里出现的
+        原文不是我们发的（发送失败路径 note_sent 已记的那条回显会滞留
+        10 分钟，期间有人原样发广告原文会被当回显忽略，概率趋近于零）。
+        """
+        now = time.time() if now is None else now
+        chat_id = str(chat_id)
+        with self._lock:
+            cooldown = float(self.config().get('cooldown_seconds') or 0)
+            self._last_sent[chat_id] = (now + max(0.0, float(backoff_seconds))
+                                        - cooldown)
             self._save_state_locked()
 
     def is_echo(self, chat_id: str, text: str, now: float = None) -> bool:

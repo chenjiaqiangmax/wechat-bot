@@ -71,6 +71,35 @@ class TestPopupAliasRow(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[2], 90, '下半部分（网络结果）不该被当联系人')
 
+    def test_ocr_confused_alias_still_finds_contact(self):
+        """OCR 把 1 读成 l 时仍要命中联系人行。
+
+        2026-11-20 实测：搜东耳映晓的微信号 cx1666688888，浮层里被读成
+        ``cxl666688888``，精确包含匹配永不命中，机器人连试 4 轮后暂停。
+        """
+        rows = [
+            ('东豆映晓', 80, 54, 90, 18),
+            ('彳1号：cxl666688888', 80, 79, 150, 16),
+            ('0Apple-aiEE', 61, 150, 80, 16),
+            ('思包含：东巨映〔信号：cxl666688888）', 60, 174, 240, 18),
+            ('瘦索网结果', 62, 212, 90, 16),
+        ]
+        hit = _popup_alias_row(rows, 'cx1666688888', 290)
+        self.assertIsNotNone(hit, 'OCR 读成 cxl 后应仍能命中')
+        self.assertEqual(hit[2], 79, '应点联系人那行，不是下面的群聊行')
+
+    def test_confused_group_row_alone_is_still_refused(self):
+        """只有群聊行含（错读的）alias 时不能点——哪怕它落在上限之内。
+
+        分区标题也可能被 OCR 认错（「群聊」→「0Apple-aiEE」），
+        所以群聊项要靠行内固定的「包含：」兜底排除。
+        """
+        rows = [
+            ('东豆映晓', 80, 40, 90, 18),          # 姓名行不含 alias
+            ('思包含：东巨映〔信号：cxl666688888）', 60, 90, 240, 18),
+        ]
+        self.assertIsNone(_popup_alias_row(rows, 'cx1666688888', 290))
+
 
 class _FakeDB:
     """通讯录替身：两个同名「强」，只有一个带微信号。"""

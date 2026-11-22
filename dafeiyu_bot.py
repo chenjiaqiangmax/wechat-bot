@@ -1083,6 +1083,20 @@ class DaFeiYuBot:
                           f'{"已核对出站记录" if recorded else "已送达"}并移出待发',
                           flush=True)
                     continue
+                if UNCONFIRMED_SEND_MARK in (err or ''):
+                    # 「结果未确认」既不是送达也不是失败：消息可能已经发出，
+                    # 唯一安全的后续是下一轮 _reply_recorded 查库核对。
+                    # 这条分支不能落到下面的 else——那里会 paused=True，
+                    # 而恢复循环要求 not paused，待发就永远清不掉了
+                    # （2026-11-21 08:23 实测：消息已入库，机器人却被暂停）。
+                    with self._pending_lock:
+                        updated = dict(self._pending_replies)
+                        if key in updated:
+                            updated[key] = {**entry, 'last_error': err}
+                            self._save_pending_locked(updated)
+                    print(f'[待发] {entry["chat_id"]}：结果未确认，保留答案，'
+                          f'下一轮查库核对后决定是否补发', flush=True)
+                    return
                 if any(k in (err or '') for k in SKIP_SEND_REASONS):
                     rounds = int(entry.get('rounds', 0) or 0) + 1
                     if rounds >= PENDING_MAX_ROUNDS:
@@ -2277,8 +2291,9 @@ class DaFeiYuBot:
             at_name, at_reason = self._resolve_keyword_ad_at(
                 chat, sender_wxid, sender_name)
             if not at_name:
-                # 这轮不 @ 就不发；仍占冷却，避免每条命中都反复尝试同一个人
-                engine.note_sent(chat_id, reply)
+                # 这轮不 @ 就不发；只记短退避，不占满 30 分钟冷却——
+                # OCR 这次没认出成员，下一条命中消息几分钟内还能再试
+                engine.note_fail(chat_id)
                 print(f'[关键词广告] {where} 命中「{kws}」，'
                       f'无法确定 @ 对象（{at_reason}），未发送', flush=True)
                 engine.log_hit({**base, 'reply': '',
@@ -2314,6 +2329,10 @@ class DaFeiYuBot:
                             'at_mode': at_mode,
                             'result': 'sent' if ok else 'failed',
                             'error': (err or '')[:200]})
+            if not ok:
+                # 发送失败别占满 30 分钟冷却：回拨成 5 分钟短退避，
+                # 下一条命中消息就能重试，广告不至于一次失败就丢掉
+                engine.note_fail(chat_id)
         except Exception:
             import traceback
             print('[关键词广告] 处理异常\n' + traceback.format_exc(),

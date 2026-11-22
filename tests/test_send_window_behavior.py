@@ -25,6 +25,9 @@ class TestEnsureVisibleDoesNotTouchOtherWindows(unittest.TestCase):
         gui.bring_to_front = Mock(return_value=True)
         gui._update_render_rect = Mock()
         gui.is_alive = Mock(return_value=alive)
+        # 窗口可见性由独立的 _main_window_shown 判定（收进托盘时为 False）；
+        # 这里关注的是「不最小化别人」，默认视为可见。
+        gui._main_window_shown = Mock(return_value=True)
         return gui
 
     def test_ensure_visible_does_not_activate_by_default(self):
@@ -150,6 +153,58 @@ class TestSendFastPathVerifiesChat(unittest.TestCase):
         gui.input_text.assert_called_once()
         self.assertTrue(gui.input_text.call_args.kwargs.get('fast'))
         gui.open_chat.assert_not_called()
+
+
+class TestEnsureVisibleWhenWindowHidden(unittest.TestCase):
+    """微信收进托盘（WS_VISIBLE=False）时 ensure_visible 必须返回 False。
+
+    2026-11-20 深夜：微信被收进托盘，进程和句柄都还在、WGC 还能抓到最后一帧，
+    看上去像正常界面，但真实点击和打字全部落空——机器人重试 4 轮后暂停。
+    这里锁住「先自动还原一次，还原不了就快速失败」的行为。
+    """
+
+    def _gui(self, shown_sequence=(True,)):
+        from wechatauto.guia import WeChatGUI
+        gui = object.__new__(WeChatGUI)
+        gui.main_hwnd = 12345
+        gui._last_visible_ok = False
+        gui._last_visible_ts = 0
+        gui._main_window_shown = Mock(side_effect=shown_sequence)
+        gui._update_render_rect = Mock()
+        gui.bring_to_front = Mock(return_value=True)
+        gui.is_alive = Mock(return_value=True)
+        return gui
+
+    def test_hidden_window_is_restored_once(self):
+        gui = self._gui([False, True])
+        with patch('wechatauto.guia.time.sleep', lambda *_: None), \
+                patch('wechatauto.guia._restore_keep_maximize') as restore:
+            self.assertTrue(gui.ensure_visible(activate=True),
+                            '还原成功后应报告窗口可用')
+        self.assertEqual(restore.call_args[0][1], gui.main_hwnd,
+                         '要用带最大化保护的 _restore_keep_maximize，不是裸 SW_RESTORE')
+
+    def test_still_hidden_fails_fast(self):
+        gui = self._gui()
+        gui._main_window_shown = Mock(return_value=False)
+        with patch('wechatauto.guia.time.sleep', lambda *_: None), \
+                patch('wechatauto.guia._restore_keep_maximize'):
+            self.assertFalse(gui.ensure_visible(activate=True),
+                             '窗口仍不可见时必须返回 False，让调用方快速失败')
+            self.assertFalse(gui.ensure_visible(),
+                             '不激活的分支同样不能把隐藏窗口当可用')
+
+    def test_15s_cache_does_not_hide_a_hidden_window(self):
+        """15 秒缓存期内窗口被收进托盘，也要立刻发现并失败。"""
+        import time as _t
+        gui = self._gui()
+        gui._main_window_shown = Mock(return_value=False)
+        gui._last_visible_ok = True
+        gui._last_visible_ts = _t.time()      # 缓存有效期内
+        with patch('wechatauto.guia.time.sleep', lambda *_: None), \
+                patch('wechatauto.guia._restore_keep_maximize'):
+            self.assertFalse(gui.ensure_visible(),
+                             '缓存不能让隐藏窗口蒙混过关')
 
 
 if __name__ == '__main__':
