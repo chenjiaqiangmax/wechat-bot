@@ -367,6 +367,11 @@ def has_intent(text: str, words) -> bool:
                             _CLAUSE_SEP_RE.split(probe)):
         if not any(_norm(w) and _norm(w) in clause for w in (words or ())):
             continue
+        if '有没有' in clause:
+            # 「有没有X」本身是疑问结构：宾语里的「不需要/不用」是描述
+            # 需求（「有没有不需要翻墙的模型」），不是反问——该子句跳过
+            # 否定否决。纯否定句（「没有靠谱的中转站推荐」）仍被拒。
+            return True
         if any(_norm(n) and _norm(n) in scan for n in DEFAULT_NEGATION_WORDS):
             continue
         return True
@@ -560,7 +565,10 @@ class Engine:
         now = time.time() if now is None else now
         chat_id = str(chat_id)
         with self._lock:
-            cooldown = float(self.config().get('cooldown_seconds') or 0)
+            # 退避换算要用该群实际生效的冷却（逐群覆盖优先于全局），
+            # 否则群 60s/全局 1800s 时 5 分钟退避完全无效、群 7200s 时
+            # 退避被拉长到 95 分钟。
+            _enabled, cooldown = group_rule(self.config(), chat_id)
             self._last_sent[chat_id] = (now + max(0.0, float(backoff_seconds))
                                         - cooldown)
             self._save_state_locked()
@@ -573,7 +581,12 @@ class Engine:
             return False
         with self._lock:
             for t, ts in self._echoes.get(str(chat_id), ()):
-                if t == body and now - ts < ECHO_WINDOW:
+                # 实发内容带 @ 前缀（纯文本降级 f'@{name} {reply}'、真 @
+                # 的 token 也落在正文），回显经 _strip_group_prefix 后仍
+                # 带「@名字 」——用子串比对而不是全等，否则回显防护永不
+                # 命中。子串放宽的代价：10 分钟窗口内别人原样复述广告
+                # 原文会被忽略一次，本来那条也要走冷却，可接受。
+                if (t == body or t in body) and now - ts < ECHO_WINDOW:
                     return True
         return False
 
