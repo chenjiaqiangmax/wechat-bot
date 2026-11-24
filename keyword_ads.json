@@ -20,7 +20,7 @@
     "便宜中转站",
     "便宜的中转站"
   ],
-  "reply": "https://llm.zrshuiwu.com\ndeepseek-v4.1-flash-1017  5 折",
+  "reply": "https://llm.zrshuiwu.com/\ndeepseek-v4.1-flash-1017-b (满血版)\n早8至18忙时3折\n晚18至早8闲时1.5折",
   "soft_replies": [
     "刚好看到你在找{keyword}，我这边正好在用一家，给你个参考：\\n{reply}\\n你先看看，不合适就当我没说～",
     "巧了，我最近也在看{keyword}，现在用的是这家：\\n{reply}\\n有需要可以看看，不需要忽略就行。",

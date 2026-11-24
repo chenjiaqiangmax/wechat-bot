@@ -131,7 +131,7 @@ length=4211669` 这种一行提示（原文要用 `--json` 看）；`--type` 中
 |---|---|---|
 | **读消息 / Read** | 本地 SQLCipher 4 数据库解密 / Local SQLCipher 4 DB decryption | `db.py` (WeChatDB) |
 | **实时监听 / Listen** | 数据库增量轮询 + 每会话工作线程 / DB incremental polling + per-chat workers | `db.py` (Listener) |
-| **发消息 / Send** | UIA 优先，坐标 + OCR 兜底 / UIA-first, coordinate + OCR fallback | `guia.py`, `wx.py` |
+| **发消息 / Send** | 全静默：uiacli 桥识别 + PostMessage/WM_CHAR 投递 / fully silent: uiacli bridge reads, PostMessage/WM_CHAR delivers | `guia.py`, `uiacli.py`, `wx.py` |
 | **媒体下载 / Media** | `.dat` AES 解密 / SILK 语音 / 文件复制 / `.dat` AES decrypt / SILK voice / file copy | `media.py` (MediaDownloader) |
 | **朋友圈 / Moments** | `sns.db` 直读 + UIA / direct read + UIA | `moment.py` |
 

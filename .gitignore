@@ -62,3 +62,7 @@ packaging/build/
 packaging/dist/
 packaging/*.spec
 
+# Sandboxie Plus 源码拷贝（48MB 第三方仓库，仅用于多开调研，见 docs/sandboxie-multi-wechat.md；
+# 需要时从 github.com/sandboxie-plus/Sandboxie 重新拉，不入本仓库）
+Sandboxie/
+

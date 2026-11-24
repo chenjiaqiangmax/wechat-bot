@@ -313,7 +313,7 @@ DWM 停止合成，`ImageGrab` 抛 `screen grab failed`，而 `PrintWindow` 抓�
 ## 库本体（wechatauto）
 
 机器人底层的微信 4.x 自动化能力继承自上游：本地 SQLCipher 解密读取消息/
-联系人/朋友圈、UIA+OCR 混合发送、实时监听、媒体下载。命令行工具：
+联系人/朋友圈、WinUia 桥静默发送（识别读走 uiacli、投递走 PostMessage/WM_CHAR，不碰真实键鼠）、实时监听、媒体下载。命令行工具：
 
 ```bash
 wechatauto          # 体检 + 交互菜单
