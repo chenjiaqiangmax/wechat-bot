@@ -1,0 +1,4 @@
+# .NET 构建产物（uiacli.exe 由 dotnet publish 生成，见 README 构建一节）
+bin/
+obj/
+publish/

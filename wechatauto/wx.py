@@ -1789,4 +1789,5 @@ class WeChat(Chat, Listener):
             # subprocess 直调不走 cmd.exe，且能拿到退出码
             subprocess.run(
                 ['taskkill', '/f', '/pid', str(pid.value)],
-                capture_output=True, check=False)
+                capture_output=True, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

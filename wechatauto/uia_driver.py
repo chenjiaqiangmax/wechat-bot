@@ -273,6 +273,7 @@ class WeChatUIA:
             out = subprocess.run(
                 ["tasklist", "/fi", "imagename eq Weixin.exe", "/nh"],
                 capture_output=True, text=True, encoding="gbk", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 timeout=10).stdout or ""
             if "Weixin.exe" in out:
                 return True
@@ -325,7 +326,8 @@ class WeChatUIA:
             pass
         try:
             import subprocess
-            subprocess.Popen([DEFAULT_EXE])
+            subprocess.Popen([DEFAULT_EXE],
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception:
             wxlog.warning("拉起微信失败")
 

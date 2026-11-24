@@ -58,8 +58,13 @@ class WechatautoLogger:
         # 格式
         fmt = '%(asctime)s [%(name)s] [%(levelname)s] [%(filename)s:%(lineno)d]  %(message)s'
 
-        # 控制台处理器（带颜色）
-        self.console_handler = logging.StreamHandler()
+        # 控制台处理器（带颜色）。pythonw 下 sys.stderr 是 None，StreamHandler
+        # 挂上去后每条日志都打一轮「stream.write NoneType」Traceback 污染
+        # 文件日志（实测 2026-11-22 18:26），改挂 NullHandler——文件日志照常。
+        if sys.stderr is None:
+            self.console_handler = logging.NullHandler()
+        else:
+            self.console_handler = logging.StreamHandler()
         console_formatter = ColoredFormatter(
             fmt=fmt,
             datefmt="%Y-%m-%d %H:%M:%S"

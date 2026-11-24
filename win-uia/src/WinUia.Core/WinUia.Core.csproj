@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>A dependency-free .NET wrapper around the Windows UI Automation (UIA3) COM API, with physical mouse and keyboard input.</Description>
+  </PropertyGroup>
+
+</Project>

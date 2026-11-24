@@ -228,7 +228,8 @@ def key_hold() -> float:
 def _is_cjk(ch: str) -> bool:
     """是否按中文速度停顿的字符；全角标点也算，读起来才像中文输入。"""
     return ('\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf'
-            or '\uf900' <= ch <= '\ufaff' or '\u3000' <= ch <= '\u303f')
+            or '\uf900' <= ch <= '\ufaff' or '\u3000' <= ch <= '\u303f'
+            or '\uff00' <= ch <= '\uffef')   # ，！？；：（）等全角标点
 
 
 def _unicode_units(ch: str):
@@ -297,14 +298,20 @@ def _press_shift_enter() -> None:
         time.sleep(0.02)
 
 
-def type_text(text: str, rng=None, fast: bool = None) -> float:
+def type_text(text: str, rng=None, fast: bool = None,
+              focus_check=None) -> float:
     """把文本逐字打进当前焦点控件，返回按计划累计的停顿秒数。
 
-    不碰剪贴板；调用方负责确认焦点在前台微信输入框。实际 sleep 总和与
-    返回值一致，便于日志里区分「打字慢」和「UIA 卡住」。
+    不碰剪贴板；调用方负责确认焦点在前台微信输入框。
+    ``focus_check``：可选无参函数，打字过程中每 8 个字符调一次；返回
+    False 表示前台已不是微信（用户切走了），立即中止并返回 -1.0——
+    继续打会把消息正文逐字打进用户正用的窗口。
     """
     total = 0.0
-    for kind, payload, delay in typing_plan(text, rng=rng, fast=fast):
+    plan = typing_plan(text, rng=rng, fast=fast)
+    for i, (kind, payload, delay) in enumerate(plan):
+        if focus_check is not None and i % 8 == 0 and not focus_check():
+            return -1.0
         if kind == 'unit':
             _send_unicode_unit(payload)
         elif kind == 'newline':

@@ -1042,6 +1042,7 @@ class MediaDownloader:
                 r = subprocess.run(
                     [exe, "-y", "-v", "error", "-i", src, "-frames:v", "1", dst],
                     capture_output=True, timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except Exception:
                 return None

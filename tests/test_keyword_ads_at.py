@@ -123,6 +123,41 @@ class _FakeInput:
         pass
 
 
+class _FakeUser32:
+    """替身 user32：PostMessageW 只记录，不往真微信窗口投任何消息。"""
+
+    def __init__(self):
+        self.posted = []
+
+    def PostMessageW(self, hwnd, msg, wp, lp):
+        self.posted.append((hwnd, msg, wp, lp))
+        return 1
+
+    def GetForegroundWindow(self):
+        return 0
+
+    def IsWindow(self, hwnd):
+        return False
+
+    def SetForegroundWindow(self, hwnd):
+        return 1
+
+    def IsIconic(self, hwnd):
+        return 0
+
+    def WindowFromPoint(self, pt):
+        return 111      # 落点反查：替身里恒返回主窗口
+
+    def GetWindowThreadProcessId(self, hwnd, out):
+        obj = getattr(out, '_obj', None)   # 调用方传 ctypes.byref(pid)
+        if obj is not None:
+            obj.value = 1                  # 与替身 pid 一致即可
+        return 0
+
+    def ScreenToClient(self, hwnd, pt):
+        return 1
+
+
 class TestAtMemberReadback(unittest.TestCase):
     def setUp(self):
         # 落库校验现在是轮询；测试里把等待/间隔压到毫秒级，避免用例变慢。
@@ -130,6 +165,7 @@ class TestAtMemberReadback(unittest.TestCase):
         self._old_interval = guia.WxParam.DB_VERIFY_INTERVAL
         guia.WxParam.DB_VERIFY_TIMEOUT = 0.2
         guia.WxParam.DB_VERIFY_INTERVAL = 0.01
+        self.user32 = _FakeUser32()
 
     def tearDown(self):
         guia.WxParam.DB_VERIFY_TIMEOUT = self._old_timeout
@@ -138,29 +174,27 @@ class TestAtMemberReadback(unittest.TestCase):
     def _gui(self, read_values, click_ok=True, verify_ok=True):
         gui = object.__new__(guia.WeChatGUI)
         gui.ensure_visible = lambda *a, **kw: True
-        # at_member 现在显式抢前台（真 @ 必须真实键盘焦点），替身里直接放行。
-        gui.bring_to_front = lambda *a, **kw: True
-        # 成员弹层不再 OCR 认名字，改为按窗口矩形点第一行；替身给一个固定矩形。
-        gui._find_at_popup_window = lambda box: (0, 0, 200, 80)
-        # UIA 认人是真 @ 的唯一依据：替身里默认认到「张三」，需要认不到的
-        # 用例自己覆盖成 lambda *a: None。
-        gui._uia_mention_item = lambda member, core: _FakeListItem('张三')
-        gui.wx_click = lambda x, y: None
-        gui.open_chat = lambda who: True
-        gui.focus_input = lambda: True
-        gui._input = _FakeInput()
-        gui.get_input_box = lambda: (0, 0, 100, 100)
-        gui.ocr = lambda box: [('张三', 10, 10, 20, 20)]
-        gui.wx_click = lambda x, y: None
+        gui.main_hwnd = 111
+        gui.pid = 1          # _post_click_screen 落点校验：替身窗口归属进程 1
         gui.origin_x = gui.origin_y = 0
         gui.right_pane_left = 0
         gui.render_w = gui.render_h = 100
+        # UIA 认人是真 @ 的唯一依据：替身里默认认到「张三」，需要认不到的
+        # 用例自己覆盖成 lambda *a: None。
+        gui._uia_mention_item = lambda member, core: ('张三', [0, 0, 40, 20])
+        # 点选成员走 _post_click_ctrl；替身返回成功。
+        uia = mock.Mock()
+        uia._post_click_ctrl = mock.Mock(return_value=True)
+        gui._get_uia = lambda: uia
+        gui.open_chat = lambda who: True
+        gui.focus_input = lambda: True
+        gui._focus_input_via_post = lambda: True
+        gui.get_input_box = lambda: (0, 0, 100, 100)
         gui._last_input_box = None
         gui._pending_text = None
         gui._send_attempted = False
         gui.clicked = 0
         gui.cleared = 0
-        gui.verified = []
 
         def click_send():
             gui.clicked += 1
@@ -168,22 +202,25 @@ class TestAtMemberReadback(unittest.TestCase):
             return click_ok
 
         gui.click_send = click_send
-        gui._clear_input = lambda: setattr(gui, 'cleared', gui.cleared + 1)
+        gui.clear_input = lambda: setattr(gui, 'cleared', gui.cleared + 1)
         gui._send_watermark = lambda who: 0
-        gui._verify_sent = lambda *a, **kw: verify_ok
+        gui._wait_landed = lambda *a, **kw: verify_ok
         values = iter(read_values)
         gui.read_input_text = lambda: next(values)
         return gui
 
+    def _run(self, gui, member='张三', text='你好', who='测试群', verify=False):
+        with mock.patch.object(guia.ctypes, 'windll',
+                               mock.Mock(user32=self.user32)), \
+                mock.patch.object(guia.time, 'sleep'):
+            return guia.WeChatGUI.at_member(gui, member, text, who, verify)
+
     def test_success_appends_body_after_at_token(self):
         gui = self._gui(['@张三', '@张三你好'])
-        typed = []
-        with mock.patch.object(guia.rhythm, 'type_text',
-                               side_effect=lambda text: typed.append(text)):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        r = self._run(gui)
         self.assertTrue(r.is_success)
-        self.assertEqual(typed, ['你好'])          # 没有调用 input_text 清空重打
-        self.assertEqual(gui._input.typed, ['@', '张三'])
+        # '@' + 过滤核心字「张三」经 WM_CHAR 投递，正文追加不再清空
+        self.assertEqual(len(self.user32.posted), 7)  # @1+核心字2+正文2+点选DOWN/UP2
         self.assertEqual(gui.clicked, 1)
         self.assertEqual(r['data']['at_name'], '张三')
         self.assertTrue(r['data']['at_token_ok'])
@@ -193,53 +230,43 @@ class TestAtMemberReadback(unittest.TestCase):
         """UIA 认不到人时不能拿输入框里的纯文本「@张三」冒充真 @。"""
         gui = self._gui(['@张三'])
         gui._uia_mention_item = lambda *a: None
-        typed = []
-        with mock.patch.object(guia.rhythm, 'type_text',
-                               side_effect=lambda text: typed.append(text)):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        r = self._run(gui)
         self.assertFalse(r.is_success)
-        self.assertEqual(r['data']['reason'], 'at_unverified')
-        self.assertEqual(gui.cleared, 1)
+        self.assertEqual(r['data']['reason'], 'at_failed')
+        self.assertEqual(gui.cleared, 2)   # 开头清残留 + 认人失败清空
         self.assertEqual(gui.clicked, 0)
-        self.assertEqual(typed, [])
 
     def test_token_mismatch_clears_and_does_not_send(self):
         """UIA 认到的人与读回对不上时按 token 不一致处理。"""
         gui = self._gui(['@张三'])
-        gui._uia_mention_item = lambda *a: _FakeListItem('李四')
-        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        gui._uia_mention_item = lambda *a: ('李四', [0, 0, 40, 20])
+        r = self._run(gui)
         self.assertFalse(r.is_success)
         self.assertEqual(r['data']['reason'], 'at_token_mismatch')
-        self.assertEqual(gui.cleared, 1)
+        self.assertEqual(gui.cleared, 2)   # 开头清残留 + 失败清空
         self.assertEqual(gui.clicked, 0)
 
     def test_body_mismatch_clears_and_does_not_send(self):
         gui = self._gui(['@张三', '@张三'])
-        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        r = self._run(gui)
         self.assertFalse(r.is_success)
         self.assertEqual(r['data']['reason'], 'at_body_mismatch')
-        self.assertEqual(gui.cleared, 1)
+        self.assertEqual(gui.cleared, 2)   # 开头清残留 + 失败清空
         self.assertEqual(gui.clicked, 0)
 
     def test_unreadable_input_fails_closed(self):
         gui = self._gui([''])
-        r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群')
+        r = self._run(gui)
         self.assertFalse(r.is_success)
         self.assertEqual(r['data']['reason'], 'at_unverified')
         self.assertEqual(gui.clicked, 0)
 
     def test_verify_true_success_and_failure(self):
         gui = self._gui(['@张三', '@张三你好'], verify_ok=True)
-        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群',
-                                         verify=True)
+        r = self._run(gui, verify=True)
         self.assertTrue(r.is_success)
         gui2 = self._gui(['@张三', '@张三你好'], verify_ok=False)
-        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
-            r2 = guia.WeChatGUI.at_member(gui2, '张三', '你好', '测试群',
-                                          verify=True)
+        r2 = self._run(gui2, verify=True)
         self.assertFalse(r2.is_success)
 
     def test_verify_polls_until_landed(self):
@@ -254,14 +281,12 @@ class TestAtMemberReadback(unittest.TestCase):
 
         def flaky(*args, **kwargs):
             calls['n'] += 1
-            return calls['n'] >= 2      # 第一次还没落库，第二次落库
+            return True                  # 轮询到落库（真实现内部循环）
 
-        gui._verify_sent = flaky
-        with mock.patch.object(guia.rhythm, 'type_text', return_value=0):
-            r = guia.WeChatGUI.at_member(gui, '张三', '你好', '测试群',
-                                         verify=True)
+        gui._wait_landed = flaky
+        r = self._run(gui, verify=True)
         self.assertTrue(r.is_success, r)
-        self.assertGreaterEqual(calls['n'], 2)
+        self.assertEqual(calls['n'], 1)   # 轮询封装在 _wait_landed 内部，外部只调一次
 
 if __name__ == '__main__':
     unittest.main()

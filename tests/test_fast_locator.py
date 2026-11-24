@@ -9,14 +9,11 @@ from PIL import Image, ImageDraw
 from wechatauto.guia import (
     INPUT_BOX_RATIO,
     WeChatGUI,
-    _best_session_row,
     _blank_frame,
     _cached_input_box_matches_frame,
-    _chat_name_score,
     _detect_input_box_from_frame,
     _openim_title_match,
-    _popup_result_row,
-    _search_candidate_row,
+    _strip_emoji,
 )
 
 
@@ -103,70 +100,6 @@ class TestSingleFrameInputLocator(unittest.TestCase):
                     int(900 * INPUT_BOX_RATIO[2]), int(650 * INPUT_BOX_RATIO[3]))
         self.assertEqual(box, expected)
 
-    def test_search_candidate_accepts_group_result_but_not_member_preview(self):
-        rows = [
-            ('群聊', 12, 40, 30, 16),
-            ('目标群', 30, 80, 90, 20),
-            ('成员，包含：目标群', 30, 110, 150, 18),
-        ]
-        self.assertEqual(_search_candidate_row(rows, '目标群'), rows[1])
-
-    def test_similar_or_ambiguous_search_names_are_rejected(self):
-        similar = [('目标群2', 30, 80, 90, 20)]
-        duplicate = [('目标群', 30, 80, 90, 20), ('目标群', 30, 110, 90, 20)]
-        self.assertIsNone(_search_candidate_row(similar, '目标群'))
-        self.assertIsNone(_search_candidate_row(duplicate, '目标群'))
-        self.assertEqual(_chat_name_score('件传输助', '文件传输助手'), 2)
-        self.assertEqual(_chat_name_score('文件传输助手', '文件传输助手'), 3)
-        self.assertEqual(_chat_name_score('文件传输助手（450）', '文件传输助手'), 3)
-        # openim（企业微信互通）联系人在浮层里显示「名字@企业名」，是平台装饰。
-        self.assertEqual(_chat_name_score('代清艺@小来', '代清艺'), 1)
-        self.assertEqual(_chat_name_score('代清艺2', '代清艺'), 0)  # 数字后缀仍是另一会话
-        self.assertEqual(
-            _search_candidate_row([('代清艺@小来', 83, 63, 120, 20)], '代清艺'),
-            ('代清艺@小来', 83, 63, 120, 20))
-        # openim 行 OCR 碎读（「代」拆成「亻弋」）仍能靠 @+尾 2 字命中。
-        self.assertEqual(
-            _popup_result_row([('亻弋清艺@小米', 80, 67, 130, 20)], '代清艺', 600),
-            ('亻弋清艺@小米', 80, 67, 130, 20))
-        self.assertIsNone(
-            _popup_result_row([('代清波', 37, 179, 90, 20)], '代清艺', 600))
-        # openim 标题碎读容错：「代清艺」读成「青艺@小米」仍判打开；真近名拒配。
-        self.assertTrue(_openim_title_match('青艺@小米', '代清艺'))
-        self.assertFalse(_openim_title_match('代清华@小米', '代清艺'))
-        self.assertFalse(_openim_title_match('代清波', '代清艺'))
-        # 长群名 OCR 错 1 字（盟→燕 + 噪点 =）仍能命中；错 2 字的网络近名拒配。
-        self.assertEqual(
-            _popup_result_row([('=南昌产业联燕交流群', 80, 67, 200, 20)],
-                              '南昌产业联盟交流群', 600),
-            ('=南昌产业联燕交流群', 80, 67, 200, 20))
-        # 错 2 字的近名行真实只出现在网络结果区（微信本地群行 OCR 才会读错），
-        # 由分区标题排除；联系人区单行错 2 字在统一预算内会被救回（有意取舍：
-        # 近名群误配由数字子序列防，读错不设防）。
-        self.assertIsNone(
-            _popup_result_row([('最常便用', 36, 20, 60, 16),
-                               ('瘦索网结果', 60, 216, 80, 16),
-                               ('南昌产非联非交流群', 36, 248, 200, 20)],
-                              '南昌产业联盟交流群', 600))
-        # 13+ 字群名 OCR 错 3-4 处（实测「企业级AI大模型智能体本体1群」→
-        # 「n亓企业级A丨大樘型智能体本体1群」）：连续公共子串命中群行；
-        # 网络结果区按「瘦索网结果」标题整段排除，链接行不误配。
-        popup_rows = [
-            ('最常便用', 36, 20, 60, 16),
-            ('n亓企业级A丨大樘型智能体本体1群', 80, 66, 220, 18),
-            ('0', 60, 163, 12, 12),
-            ('[撻接]“．群聊“企业级A|大椏型智能弦本弦1群”', 30, 176, 260, 18),
-            ('瘦索网结果', 60, 216, 80, 16),
-            ('企业级A|大模型智能体本体1群', 36, 248, 220, 18),
-        ]
-        self.assertEqual(
-            _popup_result_row(popup_rows, '企业级AI大模型智能体本体1群', 600),
-            ('n亓企业级A丨大樘型智能体本体1群', 80, 66, 220, 18))
-        self.assertIsNone(_best_session_row([
-            {'name': '目标群'}, {'name': '目标群'},
-        ], '目标群'))
-
-
 def _popup_gui(clicks):
     """构造只走浮层搜索的 WeChatGUI 替身（不碰 Win32）。"""
     gui = cast(Any, object.__new__(WeChatGUI))
@@ -229,54 +162,15 @@ class TestBlankFrameAndWaitRender(unittest.TestCase):
 class TestSearchPopup(unittest.TestCase):
     """搜索结果在独立浮层窗口里：必须抓浮层，不能抓主窗。"""
 
-    def test_clicks_the_unique_popup_result(self):
-        clicks = []
-        gui = _popup_gui(clicks)
-        with patch('wechatauto.guia._find_search_popup',
-                   return_value=(999, (875, 317, 1243, 905))), \
-                patch('wechatauto.guia._capture_window_frame',
-                      return_value=Image.new('RGB', (368, 588))), \
-                patch('wechatauto.guia.ScreenOCR.recognize',
-                      return_value=_popup_x2([
-                          ('功能', 40, 30, 60, 20),
-                          ('文件传输助手', 100, 160, 200, 40),
-                          ('搜索网络结果', 40, 340, 120, 20),
-                          ('文件传输助手', 100, 400, 200, 40),
-                      ])), \
-                patch('wechatauto.guia.time.sleep'), \
-                patch('wechatauto.guia.rhythm.point', side_effect=lambda r: (
-                    (r[0] + r[2]) // 2, (r[1] + r[3]) // 2)):
-            self.assertTrue(gui._search_chat('文件传输助手'))
-        # 第一下点搜索框，第二下点浮层里的「功能」项（不是下方网络结果）
-        self.assertEqual(clicks, [(152, 53), (1075, 497)])
-
-    def test_rejects_candidate_only_in_network_results(self):
-        clicks = []
-        gui = _popup_gui(clicks)
-        with patch('wechatauto.guia._find_search_popup',
-                   return_value=(999, (875, 317, 1243, 905))), \
-                patch('wechatauto.guia._capture_window_frame',
-                      return_value=Image.new('RGB', (368, 588))), \
-                patch('wechatauto.guia.ScreenOCR.recognize',
-                      return_value=_popup_x2([
-                          ('搜索网络结果', 40, 340, 120, 20),
-                          ('文件传输助手', 100, 400, 200, 40),
-                      ])), \
-                patch('wechatauto.guia.time.sleep'), \
-                patch('wechatauto.guia.rhythm.point', side_effect=lambda r: (
-                    (r[0] + r[2]) // 2, (r[1] + r[3]) // 2)):
-            self.assertFalse(gui._search_chat('文件传输助手'))
-        self.assertEqual(clicks, [(152, 53)])   # 只点了搜索框，没点网络结果
-
     def test_missing_popup_fails_closed(self):
-        clicks = []
-        gui = _popup_gui(clicks)
-        with patch('wechatauto.guia._find_search_popup', return_value=None), \
-                patch('wechatauto.guia.time.sleep'), \
-                patch('wechatauto.guia.rhythm.point', side_effect=lambda r: (
-                    (r[0] + r[2]) // 2, (r[1] + r[3]) // 2)):
+        """搜索框定位不到时 fail-closed，不点击任何东西（uiacli 新链路）。"""
+        gui = cast(Any, object.__new__(WeChatGUI))
+        gui.main_hwnd = 111
+        gui._past_deadline = lambda: False
+        gui.ensure_visible = lambda **kw: True
+        with patch('wechatauto.guia.uiacli.find', return_value={'found': False}), \
+                patch('wechatauto.guia.time.sleep'):
             self.assertFalse(gui._search_chat('文件传输助手'))
-        self.assertEqual(clicks, [(152, 53)])
 
     def test_nonempty_pane_does_not_confirm_wrong_chat(self):
         gui = cast(Any, object.__new__(WeChatGUI))
@@ -289,5 +183,17 @@ class TestSearchPopup(unittest.TestCase):
         self.assertEqual(len(checks), 6)
 
 
-if __name__ == '__main__':
-    unittest.main()
+class TestEmojiNameStripping(unittest.TestCase):
+    """emoji 群名（💰🟥CHINA🟦🌏）OCR 读不出 emoji——目标名必须先剥再比。
+
+    2026-11-23 群发实测：三轮「搜索浮层没有唯一候选」，浮层行只剩
+    「CHINA」，带着 emoji 的目标名怎么都对不上。
+    """
+
+    def test_strip_emoji_variants(self):
+        self.assertEqual(_strip_emoji('💰🟥CHINA🟦🌏'), 'CHINA')
+        self.assertEqual(_strip_emoji('🦄Web3+AIGC 交流'), 'Web3+AIGC 交流')
+        self.assertEqual(_strip_emoji('Axmax产品大师群🍳'), 'Axmax产品大师群')
+        self.assertEqual(_strip_emoji('文件传输助手'), '文件传输助手')
+        self.assertEqual(_strip_emoji('💰🟥🟦🌏'), '')
+

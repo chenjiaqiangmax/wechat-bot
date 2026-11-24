@@ -32,37 +32,41 @@ class TestGuiaInputText(unittest.TestCase):
         gui._input_box_has_text = lambda box=None: has_text
         gui._pending_text_ok = lambda text: pending_ok
         gui._last_input_box = None
+        gui._remember_input_box = lambda box: setattr(gui, '_last_input_box', box)
         gui.set_clipboard = mock.Mock(
             side_effect=AssertionError('正文输入不应再碰剪贴板'))
         return gui
 
-    def test_full_path_types_without_clipboard(self):
+    def test_wmchar_success_skips_setvalue(self):
         gui = self._gui()
-        with mock.patch.object(guia.rhythm, 'type_text') as typed, \
+        with mock.patch.object(gui, '_input_via_wmchar', return_value=True) as wm, \
+                mock.patch.object(gui, '_input_via_uia') as sv, \
                 mock.patch.object(guia.time, 'sleep', return_value=None):
             ok = gui.input_text('你好')
         self.assertTrue(ok)
-        typed.assert_called_once_with('你好')
+        wm.assert_called_once()
+        sv.assert_not_called()
         gui.set_clipboard.assert_not_called()
         self.assertEqual(gui._pending_text, '你好')
-        self.assertEqual(gui._last_input_box, (0, 0, 100, 100))
 
-    def test_fast_path_types_without_clipboard(self):
+    def test_emoji_text_routes_to_setvalue(self):
         gui = self._gui()
-        with mock.patch.object(guia.rhythm, 'type_text') as typed, \
+        with mock.patch.object(gui, '_input_via_wmchar', return_value=None) as wm, \
+                mock.patch.object(gui, '_input_via_uia', return_value=True) as sv, \
                 mock.patch.object(guia.time, 'sleep', return_value=None):
-            ok = gui.input_text('x', box=(0, 0, 100, 100), fast=True)
+            ok = gui.input_text('带😀表情')
         self.assertTrue(ok)
-        typed.assert_called_once_with('x')
+        wm.assert_called_once()
+        sv.assert_called_once()
         gui.set_clipboard.assert_not_called()
 
-    def test_readback_mismatch_retries_once_then_fails(self):
-        gui = self._gui(has_text=False)
-        with mock.patch.object(guia.rhythm, 'type_text') as typed, \
+    def test_both_paths_fail_returns_false(self):
+        gui = self._gui()
+        with mock.patch.object(gui, '_input_via_wmchar', return_value=False), \
+                mock.patch.object(gui, '_input_via_uia', return_value=False), \
                 mock.patch.object(guia.time, 'sleep', return_value=None):
             ok = gui.input_text('你好')
         self.assertFalse(ok)
-        self.assertEqual(typed.call_count, 2)
         gui.set_clipboard.assert_not_called()
 
 

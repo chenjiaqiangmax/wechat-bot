@@ -125,6 +125,7 @@ class TestSendFastPathVerifiesChat(unittest.TestCase):
         gui._window_kind = Mock(return_value=None)
         gui._current_chat = '文件传输助手'
         gui._last_input_box = (100, 200, 300, 40)
+        gui._last_input_box_key = gui._input_box_cache_key()
         gui.ensure_visible = Mock(return_value=True)
         gui._remember_input_box = Mock()
         gui.open_chat = Mock(return_value=True)
@@ -176,13 +177,20 @@ class TestEnsureVisibleWhenWindowHidden(unittest.TestCase):
         return gui
 
     def test_hidden_window_is_restored_once(self):
+        """托盘还原首选微信全局热键（走微信自己的显示路径，不白屏）。
+
+        2026-11-23 实测：ShowWindow(SW_SHOW) 只标可见标志，Qt 收不到显示
+        事件，渲染子窗口不重建——96% 白屏且各种程序化手段救不回。热键
+        （Ctrl+Alt+W）走微信自己的显示流程，侧栏内容 100% 渲染。
+        ShowWindow 路径只作为热键没生效时的兜底。
+        """
         gui = self._gui([False, True])
         with patch('wechatauto.guia.time.sleep', lambda *_: None), \
-                patch('wechatauto.guia._restore_keep_maximize') as restore:
+                patch.object(type(gui), '_show_via_hotkey',
+                             wraps=gui._show_via_hotkey) as hotkey:
             self.assertTrue(gui.ensure_visible(activate=True),
                             '还原成功后应报告窗口可用')
-        self.assertEqual(restore.call_args[0][1], gui.main_hwnd,
-                         '要用带最大化保护的 _restore_keep_maximize，不是裸 SW_RESTORE')
+        hotkey.assert_called_once_with()
 
     def test_still_hidden_fails_fast(self):
         gui = self._gui()
@@ -205,6 +213,72 @@ class TestEnsureVisibleWhenWindowHidden(unittest.TestCase):
                 patch('wechatauto.guia._restore_keep_maximize'):
             self.assertFalse(gui.ensure_visible(),
                              '缓存不能让隐藏窗口蒙混过关')
+
+
+
+class TestWxClickBlockedRetry(unittest.TestCase):
+    """wx_click 落点被拦后的重激活重试。
+
+    2026-11-23 群发实测：用户正用电脑时，旧的「置顶后 0.35s 盲等复查」
+    会被用户切回窗口打穿，20+ 次拦截空转。新逻辑最多两轮重激活，每轮
+    确认前台真的回到微信再复查落点；全被挡才放弃并收回置顶。
+    """
+
+    def _gui(self):
+        from wechatauto.guia import WeChatGUI
+        gui = object.__new__(WeChatGUI)
+        gui._input = Mock()
+        gui.pid = 25976
+        gui.render_hwnd = 777
+        gui._input._user32.GetWindowLongW.return_value = 0
+        gui.bring_to_front = Mock(return_value=True)
+        gui.restore_zorder = Mock()
+        gui._foreground_is_wechat = Mock(return_value=True)
+        gui._input.real_click = Mock()
+        return gui
+
+    def test_retry_after_reactivate_clicks_once(self):
+        """第一次被拦、重激活后复查通过：点一次，且因抬过置顶要收回。"""
+        gui = self._gui()
+        gui.point_belongs_to_wechat = Mock(side_effect=[False, True])
+        with patch('wechatauto.guia.time.sleep'):
+            gui.wx_click(500, 300)
+        gui._input.real_click.assert_called_once()
+        gui.restore_zorder.assert_called_once()
+
+    def test_all_blocked_gives_up_without_click(self):
+        """两轮重激活后仍被拦：不点击、收回置顶。"""
+        gui = self._gui()
+        gui.point_belongs_to_wechat = Mock(return_value=False)
+        with patch('wechatauto.guia.time.sleep'):
+            gui.wx_click(500, 300)
+        gui._input.real_click.assert_not_called()
+        gui.restore_zorder.assert_called_once()
+
+    def test_unblocked_clicks_without_bringing_front(self):
+        """落点本来就属于微信：直接点，不抢前台。"""
+        gui = self._gui()
+        gui.point_belongs_to_wechat = Mock(return_value=True)
+        with patch('wechatauto.guia.time.sleep'):
+            gui.wx_click(500, 300)
+        gui._input.real_click.assert_called_once()
+        gui.bring_to_front.assert_not_called()
+        gui.restore_zorder.assert_not_called()
+
+
+    def test_second_round_rescues_after_user_switches_back(self):
+        """第一轮重激活后用户又切回窗口（复查仍拦）：第二轮救回。
+
+        旧逻辑只重激活一次、0.35s 后直接复查，复查失败就放弃——这个
+        场景在旧代码上不会点击（证伪点）。
+        """
+        gui = self._gui()
+        # 拦 → 第一轮复查仍拦（用户切回）→ 第二轮复查通过
+        gui.point_belongs_to_wechat = Mock(side_effect=[False, False, True])
+        with patch('wechatauto.guia.time.sleep'):
+            gui.wx_click(500, 300)
+        gui._input.real_click.assert_called_once()
+        self.assertEqual(gui.bring_to_front.call_count, 2)
 
 
 if __name__ == '__main__':

@@ -145,6 +145,27 @@ class TestEngine(KeywordAdsTestBase):
         d2 = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 301)
         self.assertTrue(d2['allowed'])
 
+    def test_note_fail_uses_group_cooldown_not_global(self):
+        """note_fail 的退避换算必须用该群实际冷却，不是全局值。
+
+        群冷却 60s / 全局 1800s 时，用全局值换算会把 5 分钟退避记成
+        now+300-1800=now-1500——早已过期，退避完全无效。
+        """
+        ka.save_config({'enabled': True, 'default_group_enabled': False,
+                        'keywords': ['便宜的模型'], 'reply': REPLY,
+                        'cooldown_seconds': 1800,
+                        'cooldown_jitter_seconds': 0,
+                        'groups': {'on@chatroom': {'enabled': True,
+                                                   'cooldown_seconds': 60}}},
+                       self.cfg_path)
+        e = self.engine()
+        now = time.time()
+        e.note_fail('on@chatroom', backoff_seconds=300.0, now=now)
+        d = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 100)
+        self.assertFalse(d['allowed'], '逐群冷却覆盖下退避期内仍应冷却')
+        d2 = e.evaluate('求便宜的模型', 'on@chatroom', '测试群', now=now + 301)
+        self.assertTrue(d2['allowed'], '退避 5 分钟后应允许重试')
+
     def test_disabled_group_does_not_even_match(self):
         d = self.engine().evaluate('便宜的模型', 'off@chatroom', '别的群')
         self.assertFalse(d['hit'])
@@ -416,7 +437,9 @@ class TestBotWiring(KeywordAdsTestBase):
         for name, val in (('KNOWN_CHATS_FILE',
                            os.path.join(self.dir, 'known_chats.json')),
                           ('PENDING_REPLIES_FILE',
-                           os.path.join(self.dir, 'pending.json'))):
+                           os.path.join(self.dir, 'pending.json')),
+                          ('LOG_FILE',
+                           os.path.join(self.dir, 'bot.log'))):
             self._saved[name] = getattr(botmod, name)
             setattr(botmod, name, val)
             self.addCleanup(setattr, botmod, name, self._saved[name])
@@ -488,6 +511,16 @@ class TestBotWiring(KeywordAdsTestBase):
         self.bot.on_message(_FakeMsg('便宜的模型', attr='friend',
                                      wxid='wxid_self'), chat)
         self.assertEqual(chat.sent, [])
+
+    def test_echo_with_at_prefix_ignored(self):
+        """实发内容带 @ 前缀（纯文本降级 f'@{name} {reply}'），回显经
+        _strip_group_prefix 后仍带「@名字 」——回显防护必须仍命中，
+        否则第二道防线失效时广告会自触发。"""
+        e = self.engine()
+        now = time.time()
+        e.note_sent('on@chatroom', REPLY, now=now)
+        self.assertTrue(e.is_echo('on@chatroom', f'@强 {REPLY}', now=now))
+        self.assertFalse(e.is_echo('on@chatroom', '别的闲聊', now=now))
 
     def test_echo_of_own_ad_ignored(self):
         # 冷却设为 0，排除「冷却拦截」的干扰，验证的必须是回显防护本身
