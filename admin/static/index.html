@@ -995,7 +995,8 @@ dialog.dlg::backdrop { background: rgba(7,13,26,.5); backdrop-filter: blur(3px);
         </div>
         <div class="row-switch" style="margin-top:10px">
           <span>首次执行</span>
-          <input class="input" type="datetime-local" id="bc-anchor" style="flex:1;min-width:180px">
+          <input class="input" type="time" id="bc-anchor" style="flex:1;min-width:120px">
+          <span class="bc-wd-tip">只填时：分，日期自动取今天；已过则明天</span>
         </div>
         <div class="bc-wd" id="bc-legacyTip" style="display:none">
           <span class="bc-wd-tip" id="bc-legacyMsg"></span>
@@ -1062,6 +1063,22 @@ function bcLocalToTs(v) {
   if (!v) return 0;
   const t = new Date(v).getTime();
   return isNaN(t) ? 0 : Math.floor(t / 1000);
+}
+function bcTsToTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+/* 时分 → anchor 时间戳：日期自动推算——当天该时刻，已过则明天。
+   只填 HH:MM，不再让用户写完整日期（2026-11-23 需求）。 */
+function bcTimeToAnchor(v) {
+  if (!v) return 0;
+  const [h, m] = v.split(':').map(Number);
+  if (isNaN(h) || isNaN(m) || h > 23 || m > 59) return 0;
+  const now = new Date();
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return Math.floor(d.getTime() / 1000);
 }
 function bcFmt(ts) {
   if (!ts) return '—';
@@ -1172,7 +1189,7 @@ function bcNew() {
   document.querySelector('input[name=bc-type][value=once]').checked = true;
   const soon = bcTsToLocal((Date.now() + 5 * 60000) / 1000);
   $('#bc-runat').value = soon;
-  $('#bc-anchor').value = soon;
+  $('#bc-anchor').value = bcTsToTime((Date.now() + 5 * 60000) / 1000);
   bcFillMonthDays();
   bcRepeatPick('daily');
   $$('#bc-weekRow input').forEach(b => { b.checked = false; });
@@ -1202,7 +1219,7 @@ function bcEdit(id) {
   document.querySelector(`input[name=bc-type][value=${t.schedule.type === 'loop' ? 'loop' : 'once'}]`).checked = true;
   if (t.schedule.type === 'loop') {
     bcFillMonthDays();
-    $('#bc-anchor').value = bcTsToLocal(t.next_run || t.schedule.anchor);
+    $('#bc-anchor').value = bcTsToTime(t.next_run || t.schedule.anchor);
     const kind = bcRepeatOf(t.schedule);
     // 旧版「每隔 N 小时 / N 天」在新界面没有对应选项：落到「每天」并说明会被重算
     bcRepeatPick(kind === 'legacy_interval' ? 'daily' : kind);
@@ -1584,7 +1601,7 @@ async function bcSave() {
     run_at: type === 'once' ? bcLocalToTs($('#bc-runat').value) : 0,
     unit: 'day',
     interval: 1,
-    anchor: type === 'loop' ? bcLocalToTs($('#bc-anchor').value) : 0,
+    anchor: type === 'loop' ? bcTimeToAnchor($('#bc-anchor').value) : 0,
     weekdays: [],
     month_days: [],
   };
@@ -1596,6 +1613,11 @@ async function bcSave() {
       schedule.month_days = $$('#bc-monthDays input:checked').map(b => Number(b.value));
     }
   }
+  // 用户改了执行时间才重排：next_run 传 0，后端会按新 anchor 重算；
+  // 没改就沿用旧 next_run——只改文案/目标时不会把排期打乱。
+  // 不加这个判断的话，改了时间也会被原样传回的旧 next_run 压住（2026-11-23 实测）。
+  const anchorFill = bcEditing ? bcTsToTime(bcEditing.next_run || bcEditing.schedule.anchor) : '';
+  const anchorChanged = $('#bc-anchor').value !== anchorFill;
   const task = {
     id: bcEditing ? bcEditing.id : '',
     name: $('#bc-name').value.trim(),
@@ -1604,7 +1626,7 @@ async function bcSave() {
     text: $('#bc-text').value,
     image: bcImagePick,
     schedule,
-    next_run: type === 'loop' && bcEditing ? (bcEditing.next_run || 0) : 0,
+    next_run: type === 'loop' && bcEditing && !anchorChanged ? (bcEditing.next_run || 0) : 0,
   };
   if (!task.name) { err.textContent = '任务名不能为空'; return; }
   if (!bcSel.group.size && !bcSel.user.size) { err.textContent = '至少选一个发送目标'; return; }
@@ -1736,7 +1758,13 @@ async function loadConvs() {
     let list = await api('/api/conversations?q=' + encodeURIComponent($('#convQ').value));
     const f = $('#convFilter').value; if (f) list = list.filter(c => c.status === f);
     const ag = $('#convAgent').value; if (ag) list = list.filter(c => (c.agent || '未分配') === ag);
-    const names = [...new Set((await api('/api/conversations')).map(c => c.agent || '未分配'))];
+    // Agent 名单从当前响应提取；仅当搜索把结果清空时才补拉一次全量，
+    // 不再每次按键都多打一遍不带 q 的全量解析请求。
+    let source = list;
+    if (!list.length && ($('#convQ').value.trim() || f)) {
+      source = await api('/api/conversations');
+    }
+    const names = [...new Set(source.map(c => c.agent || '未分配'))];
     const sel = $('#convAgent'), cur = sel.value;
     sel.innerHTML = '<option value="">全部 Agent</option>' + names.map(n => `<option${n === cur ? ' selected' : ''}>${esc(n)}</option>`).join('');
     const searching = $('#convQ').value.trim() || f || ag;

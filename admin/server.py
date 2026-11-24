@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """「大肥鱼」管理后台：纯标准库 HTTP 服务 + 单页前端。
 
 功能：机器人进程启停、运行状态、今日统计（解析 dafeiyu_bot.log）、
@@ -35,8 +34,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 让 `python -m admin` 之外的方式（比如从别处 import）也能找到根目录的 broadcast.py
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-import broadcast  # noqa: E402  （必须在 ROOT 入 sys.path 之后）
-import keyword_ads  # noqa: E402  # type: ignore[import-not-found]
+import broadcast
+import keyword_ads  # type: ignore[import-not-found]
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 BOT_SCRIPT = os.path.join(ROOT, 'dafeiyu_bot.py')
@@ -112,7 +111,7 @@ def _start_cmd_env() -> dict:
     try:
         with open(START_CMD, encoding='utf-8', errors='replace') as f:
             for line in f:
-                m = re.match(r'\s*set\s+(\w+)=(.*)$', line, re.I)
+                m = re.match(r'\s*set\s+(\w+)=(.*)$', line, re.IGNORECASE)
                 if m and m.group(1) in _ENV_KEYS:
                     out[_ENV_KEYS[m.group(1)]] = m.group(2).strip()
     except OSError:
@@ -212,37 +211,45 @@ def _as_bool(v) -> bool:
     return bool(v)
 
 
+# bot_config.json 的读-改-写互斥：两个保存请求并发时后写方会抹掉先写方的键
+_CONFIG_SAVE_LOCK = threading.Lock()
+
+
 def save_config(data: dict) -> dict:
     checked = validate_config(data)
-    cfg = load_config()
-    for k in CONFIG_KEYS:
-        if k not in data:
-            continue
-        v = data[k]
-        if k == 'API_KEY':
-            # 空串 = 保持原密钥不变（页面不回显密钥，用户没重填就传空）
-            if str(v or '') == API_KEY_MASK:
+    # 读-改-写整段持锁：ThreadingHTTPServer 每请求一线程，两个保存请求
+    # 并发时后写的一方会把对方的键整个抹掉（tmp+replace 只保证不半截，
+    # 不保证不丢更新）。机器人只在启动时读这个文件，进程内锁足够。
+    with _CONFIG_SAVE_LOCK:
+        cfg = load_config()
+        for k in CONFIG_KEYS:
+            if k not in data:
                 continue
-            v = str(v)
-        elif k in _BOOL_KEYS:
-            # 必须在 int 分支之前：bool 是 int 的子类，否则 false 会被写成 0
-            v = _as_bool(v)
-        elif isinstance(cfg.get(k), int) or k in ('RECENT_N', 'MAX_TOKENS',
-                                                  'TOOL_ROUNDS', 'SEARCH_DAYS',
-                                                  'CONTEXT_TOKEN_LIMIT',
-                                                  'CHATGPT_COOLDOWN',
-                                                  'CHATGPT_TIMEOUT',
-                                                  'SEND_RETRIES', 'LLM_TIMEOUT'):
-            v = int(v)
-        else:
-            v = str(v)
-        cfg[k] = v
-    cfg.update(checked)
-    raw = _migrate_legacy(_read_raw_config())
-    raw.update({k: cfg[k] for k in CONFIG_KEYS if k in cfg})
-    for k in _LEGACY_KEYS:              # 旧字段不再写盘
-        raw.pop(k, None)
-    _write_raw_config(raw)
+            v = data[k]
+            if k == 'API_KEY':
+                # 空串 = 保持原密钥不变（页面不回显密钥，用户没重填就传空）
+                if str(v or '') == API_KEY_MASK:
+                    continue
+                v = str(v)
+            elif k in _BOOL_KEYS:
+                # 必须在 int 分支之前：bool 是 int 的子类，否则 false 会被写成 0
+                v = _as_bool(v)
+            elif isinstance(cfg.get(k), int) or k in ('RECENT_N', 'MAX_TOKENS',
+                                                      'TOOL_ROUNDS', 'SEARCH_DAYS',
+                                                      'CONTEXT_TOKEN_LIMIT',
+                                                      'CHATGPT_COOLDOWN',
+                                                      'CHATGPT_TIMEOUT',
+                                                      'SEND_RETRIES', 'LLM_TIMEOUT'):
+                v = int(v)
+            else:
+                v = str(v)
+            cfg[k] = v
+        cfg.update(checked)
+        raw = _migrate_legacy(_read_raw_config())
+        raw.update({k: cfg[k] for k in CONFIG_KEYS if k in cfg})
+        for k in _LEGACY_KEYS:              # 旧字段不再写盘
+            raw.pop(k, None)
+        _write_raw_config(raw)
     return public_config(cfg)
 
 
@@ -324,12 +331,23 @@ def save_agents(agents: list) -> list:
             owner.setdefault(g, a['name'])
     if sum(1 for a in out if a['enabled'] and '*' in a['groups']) > 1:
         raise ValueError('只能有一个启用的兜底 Agent（绑定 *）')
-    raw = _read_raw_config()
-    if not raw:                         # 第一次保存：把当前生效配置一起落盘
-        raw = load_config()
-    raw['AGENTS'] = out
-    _write_raw_config(raw)
+    with _CONFIG_SAVE_LOCK:
+        raw = _read_raw_config()
+        if not raw:                         # 第一次保存：把当前生效配置一起落盘
+            raw = load_config()
+        raw['AGENTS'] = out
+        _write_raw_config(raw)
     return out
+
+
+def _chat_name_by_id() -> dict:
+    """known_chats.json 的 {chat_id: 昵称} 映射，供发送事件按会话归属。"""
+    try:
+        with open(KNOWN_CHATS_FILE, encoding='utf-8') as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: (v.get('name') or '') for k, v in known.items()}
 
 
 def list_chats() -> list:
@@ -445,8 +463,16 @@ def save_broadcast(data: dict) -> dict:
         old = next((t for t in tasks if t['id'] == task['id']), None)
         if old:
             task['created_at'] = old['created_at']
-            # 编辑时没显式改时间就沿用原来的下次执行时间，避免把排期打乱
-            if not task['next_run']:
+            # 编辑时没显式改时间就沿用原来的下次执行时间，避免把排期打乱。
+            # 判据用 anchor：用户在界面改了执行时间，anchor 跟着变，旧
+            # next_run 必须作废、按新 anchor 重排——否则 daily 任务改时间
+            # 后 next_run 被旧值压住，界面重开还是旧值（2026-11-23 实测）。
+            # once 任务没有 anchor 语义（两边都是 0），走 run_at 覆盖不受影响。
+            anchor_changed = (float(old['schedule'].get('anchor') or 0)
+                              != float(task['schedule'].get('anchor') or 0))
+            if anchor_changed:
+                task['next_run'] = 0
+            elif not task['next_run']:
                 task['next_run'] = old['next_run']
             # 正在跑的那一轮进度要保留，否则保存一下就等于让它从头重发
             if not task.get('progress') and old.get('progress'):
@@ -818,8 +844,32 @@ def _unrepr(s: str) -> str:
         return s
 
 
+_EVENTS_CACHE = {'key': None, 'value': []}
+
+
 def parse_events() -> list:
-    """把日志解析成事件列表：[{t, tag, body}]；多行异常栈归到上一事件。"""
+    """把日志解析成事件列表：[{t, tag, body}]；多行异常栈归到上一事件。
+
+    结果按三个日志文件的 (mtime, size) 缓存：/api/status 每 5 秒轮询、
+    /api/conversations 每次按键都调，日志没变时不重复正则扫几 MB 文本。
+    """
+    keys = []
+    for path in (BOT_LOG + '.2', BOT_LOG + '.1', BOT_LOG):
+        try:
+            st = os.stat(path)
+            keys.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            keys.append(None)
+    key = tuple(keys)
+    if key == _EVENTS_CACHE['key']:
+        return _EVENTS_CACHE['value']
+    events = _parse_events_uncached()
+    _EVENTS_CACHE['key'] = key
+    _EVENTS_CACHE['value'] = events
+    return events
+
+
+def _parse_events_uncached() -> list:
     events = []
     for raw in _read_log_lines():
         m = _LINE_RE.match(raw)
@@ -864,6 +914,11 @@ def build_conversations(events: list) -> list:
     fallback = next((a['name'] for a in load_agents() if '*' in (a.get('groups') or [])), '')
     for ev in events:
         tag, body = ev['tag'], ev['body']
+        if tag == '上线':
+            # 重启后上一进程「收到未回复」的条目已无从配对：继续留在队首
+            # 会把新会话的回复配到旧问题上（FIFO 弹出）。
+            pending.clear()
+            continue
         if tag == '收到':
             m = _RECV_RE.match(body)
             if not m:
@@ -897,11 +952,22 @@ def build_conversations(events: list) -> list:
         elif tag == '!!!' and convs and ('发送失败' in body or '停止重试' in body):
             (last_replied or convs[-1])['status'] = 'fail'   # 回复生成了但没发出去
         elif tag in ('发送', '待发') and last_replied is not None:
-            # 发送阶段的成败与最终送达：没有这几行，后台看不出「发出去了没有」
-            last_replied['steps'].append({'time': ev['t'].strftime('%H:%M:%S'),
-                                          'tag': tag, 'body': body})
+            # 发送阶段的成败与最终送达：没有这几行，后台看不出「发出去了没有」。
+            # [待发] 行自带 chat_id、[发送] 行 desc 是「回答@chat_id」——按会话
+            # 归属而不是一律挂 last_replied：补发场景里 A 的送达状态不能错挂
+            # 到 B 的卡片上（B 在 A 补发前完成了一轮对话）。
+            target = last_replied
+            m_chat = re.match(r'^(?:回答@)?([\w@.-]+@chatroom|wxid_[\w@.-]+'
+                              r'|[A-Za-z][\w@.-]*@[\w.-]+)', body)
+            if m_chat:
+                name = _chat_name_by_id().get(m_chat.group(1), '')
+                same = [c for c in convs if c['group'] == name] if name else []
+                if same:
+                    target = same[-1]
+            target['steps'].append({'time': ev['t'].strftime('%H:%M:%S'),
+                                    'tag': tag, 'body': body})
             if tag == '发送' and '已发出' in body:
-                last_replied['status'] = 'ok'
+                target['status'] = 'ok'
     return convs
 
 

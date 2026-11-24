@@ -50,6 +50,50 @@ TARGET_RETRY_WAIT = 4.0
 # 目的是防止「10 个目标全部临时失败」时一轮跑掉半小时。
 TASK_BUDGET_SECONDS = 900.0
 
+# 用户活跃判定：前台不是微信且最近这么多秒内有键鼠输入（2026-11-23）
+USER_INPUT_IDLE_SECONDS = 30
+
+
+def _user_active_decide(fg_is_wechat: bool, input_idle_seconds: float) -> bool:
+    """活跃判定的纯函数部分，便于单测。"""
+    return (not fg_is_wechat) and input_idle_seconds < USER_INPUT_IDLE_SECONDS
+
+
+def _user_active() -> bool:
+    """用户是否正在操作电脑：前台不是微信且最近 30s 内有键鼠输入。
+
+    群发一次几分钟，用户在用电脑时硬跑，点击全被「落点窗口不属于微信」
+    拦截（2026-11-23 实测 8/11 失败）。让路交给现有补发机制：剩余目标
+    记可重试跳过，5 分钟后补发，已成功的不会重发。
+    机器人自己注入也会刷新 LastInputInfo，但机器人干活时前台是微信
+    （它自己置前），所以用「前台不是微信」做主判据；探测异常时返回
+    False，不阻塞群发。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.windll.user32
+        fg_wechat = False
+        fg = u32.GetForegroundWindow()
+        if fg:
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+            try:
+                import psutil
+                fg_wechat = psutil.Process(pid.value).name().lower().startswith('weixin')
+            except Exception:
+                fg_wechat = False
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not u32.GetLastInputInfo(ctypes.byref(info)):
+            return False
+        idle = ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+        return _user_active_decide(fg_wechat, idle)
+    except Exception:
+        return False
+
 # 失败性质决定「当场重试」还是「留给下一轮」。
 FAIL_TRANSIENT = 'transient'      # 锁屏/断屏/UIA 卡住/COM 调用失败：过几分钟会好
 FAIL_PERMANENT = 'permanent'      # 目标已不存在、图片缺失：再试一万次也一样
@@ -556,6 +600,10 @@ class BroadcastScheduler(threading.Thread):
         后重启，只要这一轮没跑完，就从上次的位置接着发。
         """
         started = time.time()
+        # 本轮是否由「立即执行」标记触发：收尾清 run_now 前要用——本轮不是
+        # 它触发的，就不能清（执行期间后台可能刚写下了新的 run_now=True，
+        # 收尾无条件清会把那次请求抹掉，任务永不执行）。
+        was_run_now = bool(task.get('run_now'))
         targets = task['targets']
         prog = task.get('progress') or {}
         done = set(prog.get('done') or [])
@@ -604,6 +652,28 @@ class BroadcastScheduler(threading.Thread):
         # progress 不清空：里面记着这一轮已经送达的目标，补发时只发没成功的。
         retryable_failed = [r for r in results if not r['ok'] and r.get('retry')]
         if retryable_failed:
+            # 让路不是失败：调度器 30 秒后重查 _user_active，一停手立即续跑，
+            # 且不消耗重试额度（12 次上限只针对真实发送失败）。让路判定
+            # _execute 开头每次都会重做，固定等 5 分钟只是闭眼空转。
+            yielded_only = all(r.get('yield') for r in retryable_failed)
+            if yielded_only:
+                ok_n = sum(1 for r in results if r['ok'])
+                total = len(results)
+                updates = {
+                    'last_run': started,
+                    'last_status': 'retry',
+                    'last_detail': (
+                        '已成功 %d/%d，%d 个让路未发送，30 秒后重查电脑使用状态'
+                        % (ok_n, total, len(retryable_failed))),
+                    'last_results': results,
+                    'next_run': time.time() + 30,
+                }
+                updates['run_now'] = False
+                self._persist(task['id'], updates)
+                log_line('===== 任务「%s」结束：已成功 %d/%d，%d 个让路，'
+                         '30 秒后重查 ====='
+                         % (task['name'], ok_n, total, len(retryable_failed)))
+                return
             retries = int(task.get('retry_count') or 0) + 1
             if retries <= MAX_TRANSIENT_RETRIES:
                 ok_n = sum(1 for r in results if r['ok'])
@@ -618,9 +688,13 @@ class BroadcastScheduler(threading.Thread):
                            MAX_TRANSIENT_RETRIES, retryable_failed[0]['error'])),
                     'last_results': results,
                     'retry_count': retries,
-                    'run_now': False,
                     'next_run': time.time() + TRANSIENT_RETRY_SECONDS,
                 }
+                # 本轮消费掉的 run_now 必须清掉，否则下轮 _tick 仍判 due、
+                # 每 30 秒空转一轮（11-23 17:21 实锤连烧 6 次）。执行期间
+                # 后台新写的 run_now 会被一并清掉——那人再点一次即可，
+                # 比无限循环代价小。
+                updates['run_now'] = False
                 self._persist(task['id'], updates)
                 print('[群发] 「%s」已成功 %d/%d，%d 个临时失败，%d 分钟后补发'
                       '（第 %d/%d 次）：%s'
@@ -658,11 +732,12 @@ class BroadcastScheduler(threading.Thread):
             'last_detail': detail,
             'last_results': results,
             'run_count': int(task.get('run_count') or 0) + 1,
-            'run_now': False,
             'retry_count': 0,
             # 这一轮已经跑完（不管成没成），续跑标记清掉：下个周期是全新的一轮
             'progress': {},
         }
+        if was_run_now:
+            updates['run_now'] = False
         nxt = compute_next_run(task, time.time(), after_run=True)
         updates['next_run'] = nxt or 0
         if nxt is None:
@@ -693,10 +768,23 @@ class BroadcastScheduler(threading.Thread):
         out = []
         total = len(task['targets'])
         idx = {t.get('id'): i for i, t in enumerate(task['targets'], 1)}
+        yielded = False
         for target in pending:
             tid = target.get('id') or ''
             name = target.get('name') or tid
             slot = idx.get(tid, 0)
+            if not yielded and _user_active():
+                # 用户正在用电脑：继续硬跑就是把剩下几十个目标赌在窗口
+                # 不被盖上（2026-11-23 实测 8/11 失败）。本轮到此为止，
+                # 剩余目标记可重试，交给 5 分钟后的补发轮；已发出的不动。
+                yielded = True
+                log_line('===== 用户正在操作电脑，剩余目标本轮让路 =====')
+                print('[群发] 用户正在操作电脑，剩余目标让路，稍后补发', flush=True)
+            if yielded:
+                out.append({'target': name, 'ok': False, 'retry': True,
+                            'yield': True,
+                            'error': '用户正在操作电脑，本轮让路未发送'})
+                continue
             if time.time() - started > TASK_BUDGET_SECONDS:
                 out.append({'target': name, 'ok': False, 'retry': True,
                             'error': '本轮已超 %.0fs 预算，跳过'

@@ -926,6 +926,7 @@ class DaFeiYuBot:
         self._agents_mtime = self._cfg_mtime()
         self.known = self._load_known()     # 见过的会话 {id: {name, last, group}}，管理页选群用
         self._known_saved = 0.0
+        self._known_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending_delivery_lock = threading.Lock()
         self._pending_chats = {}
@@ -1066,11 +1067,18 @@ class DaFeiYuBot:
                     continue
                 recorded = (key in self._pending_delivered
                             or self._reply_recorded(entry, db))
-                if recorded:
+                if entry.get('hold'):
+                    # 已停发（未确认轮数到上限）：只查库核对，查到就正常
+                    # 移出，查不到继续等，绝不再发。
+                    if not recorded:
+                        continue
+                    ok, err = True, None
+                elif recorded:
                     ok, err = True, None
                 else:
                     ok, err = self._send_retry(
-                        lambda: chat.SendMsg(entry['answer']), '回答')
+                        lambda: chat.SendMsg(entry['answer']),
+                        f"回答@{entry['chat_id']}")
                 if ok:
                     # 确认落盘失败时保留内存标记；重启后再以真实出站记录核对。
                     self._pending_delivered.add(key)
@@ -1089,13 +1097,29 @@ class DaFeiYuBot:
                     # 这条分支不能落到下面的 else——那里会 paused=True，
                     # 而恢复循环要求 not paused，待发就永远清不掉了
                     # （2026-11-21 08:23 实测：消息已入库，机器人却被暂停）。
+                    # 但「查库不中→再发一次→又未确认」若永不收敛就是无限
+                    # 重复刷屏（落库归一化差异会让比对永久失配），所以
+                    # 未确认也计数：到上限后标记 hold，恢复循环只查库不发送。
+                    unconf = int(entry.get('unconfirmed_rounds', 0) or 0) + 1
                     with self._pending_lock:
                         updated = dict(self._pending_replies)
                         if key in updated:
-                            updated[key] = {**entry, 'last_error': err}
+                            updated[key] = {**entry, 'last_error': err,
+                                            'unconfirmed_rounds': unconf}
                             self._save_pending_locked(updated)
-                    print(f'[待发] {entry["chat_id"]}：结果未确认，保留答案，'
-                          f'下一轮查库核对后决定是否补发', flush=True)
+                    if unconf >= PENDING_MAX_ROUNDS:
+                        with self._pending_lock:
+                            updated = dict(self._pending_replies)
+                            if key in updated:
+                                updated[key] = {**updated[key], 'hold': True}
+                                self._save_pending_locked(updated)
+                        print(f'[!!!] 待发 {entry["chat_id"]}：连续 {unconf} 轮结果'
+                              f'未确认，停止自动补发（消息可能已发出，防重复刷屏）；'
+                              f'每轮仍查库核对，确认发出即移出', flush=True)
+                        return
+                    print(f'[待发] {entry["chat_id"]}：结果未确认（{unconf}/'
+                          f'{PENDING_MAX_ROUNDS}），保留答案，下一轮查库核对后'
+                          f'决定是否补发', flush=True)
                     return
                 if any(k in (err or '') for k in SKIP_SEND_REASONS):
                     rounds = int(entry.get('rounds', 0) or 0) + 1
@@ -1189,21 +1213,27 @@ class DaFeiYuBot:
             return {}
 
     def _touch_known(self, chat_id: str, name: str) -> None:
-        """记下见过的会话；新会话立即落盘，老会话最多 60 秒落一次。"""
+        """记下见过的会话；新会话立即落盘，老会话最多 60 秒落一次。
+
+        on_message 由每会话独立线程并发调用：不加锁时 json.dump 迭代
+        期间另一线程写字典会抛 RuntimeError（吞掉当条回复），共用同一个
+        tmp 文件会交错写成半截 JSON。锁内写 + tmp 带线程号双保险。
+        """
         if not chat_id:
             return
-        new = chat_id not in self.known
-        self.known[chat_id] = {'name': name, 'last': int(time.time()),
-                               'group': chat_id.endswith('@chatroom')}
-        if new or time.time() - self._known_saved > 60:
-            self._known_saved = time.time()
-            try:
-                tmp = KNOWN_CHATS_FILE + '.tmp'
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump(self.known, f, ensure_ascii=False)
-                os.replace(tmp, KNOWN_CHATS_FILE)
-            except OSError:
-                pass
+        with self._known_lock:
+            new = chat_id not in self.known
+            self.known[chat_id] = {'name': name, 'last': int(time.time()),
+                                   'group': chat_id.endswith('@chatroom')}
+            if new or time.time() - self._known_saved > 60:
+                self._known_saved = time.time()
+                try:
+                    tmp = f'{KNOWN_CHATS_FILE}.{threading.get_ident()}.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        json.dump(self.known, f, ensure_ascii=False)
+                    os.replace(tmp, KNOWN_CHATS_FILE)
+                except Exception:
+                    pass
 
     @staticmethod
     def _cfg_mtime():
@@ -1833,6 +1863,14 @@ class DaFeiYuBot:
             return False, (f'UIA 无响应：微信 {UIA_PROBE_TIMEOUT:.0f}s 内没有回应'
                            f'控件查询，答案保留待发')
         for i in range(attempts):
+            if i > 0:
+                # 两次尝试仅隔 SEND_RETRY_WAIT 秒，期间可能断屏/锁屏——
+                # 入口处的前置检查已失效，盲发会卡死并占住 send_lock，
+                # 最后只能靠看门狗杀整进程。命中 SKIP 原因交待发机制。
+                if not self._session_active():
+                    return False, 'Windows 会话不可交互（远程断开/锁屏），本轮不发送'
+                if not self._desktop_readable():
+                    return False, '桌面不可读（会话断开/锁屏，画面已冻结），本轮不发送'
             raised = False
             attempt_t0 = time.time()
             try:
@@ -2340,8 +2378,6 @@ class DaFeiYuBot:
 
     def on_message(self, msg, chat) -> None:
         try:
-            if self.paused:
-                return                      # 已因发送失败暂停：只听不回，等人工重启
             self._record(msg, chat)         # 什么消息都先进围观记录
             # 每条到达的消息都留一行（不回答的也留）：排查「监听是否在跑」
             # 全靠它，否则日志里除了被 @ 的那几次什么都看不见
@@ -2352,6 +2388,11 @@ class DaFeiYuBot:
             # 用「消息」而非「收到」：后台按 [收到]/[回复] 配对对话记录，
             # 普通消息也用「收到」会让它们占位成待回复，把真对话配错
             print(f'[消息] {_where} | {_who}: {_text[:60]!r}', flush=True)
+            if self.paused:
+                # 已因发送失败暂停：只听不回，等人工重启。检查放在 _record
+                # 与 [消息] 行之后——暂停态在日志里也要可观测，否则分不清
+                # 「正常暂停」和「监听线程死了」。
+                return
             if getattr(msg, 'attr', '') == 'self':
                 return                      # 自己（包括机器人本人）发的不管
             if msg.type not in ('text', '文本'):

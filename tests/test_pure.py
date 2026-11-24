@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import unittest
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -760,6 +761,12 @@ class TestBroadcastTransientRetry(unittest.TestCase):
         broadcast.TASKS_FILE = os.path.join(self.dir, 'tasks.json')
         broadcast.BROADCAST_LOG = os.path.join(self.dir, 'broadcast.log')
         broadcast.LOCK_FILE = broadcast.TASKS_FILE + '.lock'
+        # 让路判定读真实键入活动——跑测试的人正在打字会把目标全判成
+        # 「让路未发送」，劫走本类的失败分类用例。测试视为用户不活跃。
+        self._ua = patch.object(broadcast, '_user_active',
+                                lambda: False)
+        self._ua.start()
+        self.addCleanup(self._ua.stop)
 
         def _restore():
             (broadcast.TASKS_FILE, broadcast.BROADCAST_LOG,
@@ -1071,6 +1078,11 @@ class TestBroadcastPartialAndResume(unittest.TestCase):
         b.BROADCAST_LOG = os.path.join(self.dir, 'broadcast.log')
         b.LOCK_FILE = b.TASKS_FILE + '.lock'
         b.TARGET_RETRY_WAIT = 0
+        # 让路判定读真实键入活动——跑测试的人正在打字就会把所有目标判成
+        # 「让路未发送」，预算/断点用例全被劫走。测试一律视为用户不活跃。
+        self._ua = patch.object(b, '_user_active', lambda: False)
+        self._ua.start()
+        self.addCleanup(self._ua.stop)
 
     def tearDown(self):
         b = self.b
@@ -1150,6 +1162,31 @@ class TestBroadcastPartialAndResume(unittest.TestCase):
         after = self.b.load_tasks()[0]
         self.assertEqual(after['last_status'], 'success')
         self.assertEqual(len(after['last_results']), 2)
+
+    def test_roundtrip_stop_restart_resume(self):
+        """停用→重启→续跑往返：中断收尾保留 done，重启续跑不重发已成功的。
+
+        注：正常跑完一轮（无临时失败）收尾会清 progress——loop 任务每个
+        周期本来就要重发全部目标，断点只在「中断续跑」语义下生效。
+        """
+        from unittest import mock
+        self._make([('a', '群A'), ('b', '群B')],
+                   progress={'run_id': 'r1', 'started_at': 1.0,
+                             'done': ['a']})
+        calls = []
+
+        def send(target, _t):
+            calls.append(target['id'])
+            return False, 'COMError: x', True    # b 临时失败，本轮中断
+
+        sched = self.b.BroadcastScheduler(send_fn=send)   # 重启后的新进程
+        sched._gap = 0.0
+        with mock.patch.object(self.b, 'TARGET_ATTEMPTS', 1):
+            sched._execute(self.b.load_tasks()[0])       # 续跑
+        self.assertEqual(calls, ['b'])           # a 已发过，绝不重发
+        after = self.b.load_tasks()[0]
+        self.assertEqual(after['progress']['done'], ['a'])   # 断点保留
+        self.assertEqual(after['last_status'], 'retry')      # 留给续跑
 
     def test_budget_stops_remaining_targets(self):
         task = self._make([('a', '甲'), ('b', '乙')])
